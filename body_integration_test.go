@@ -114,6 +114,20 @@ func TestBodyIntegration(t *testing.T) {
 	rows = append(rows, requestRow{RequestID: "binary", StartedAt: ts, CompletedAt: ts, Model: "fixture", RequestBody: string([]byte{255, 0, 128, '{', '"'})})
 	run := func(args ...string) []byte {
 		t.Helper()
+		if len(args) > 0 && (args[0] == "migrate-bodies" || args[0] == "restore-bodies") {
+			q("SYSTEM JEMALLOC PURGE")
+			ready := false
+			for attempt := 0; attempt < 20; attempt++ {
+				if string(q("SELECT (SELECT value FROM system.asynchronous_metrics WHERE metric='MemoryResident') < 0.60*(SELECT toFloat64(value) FROM system.server_settings WHERE name='max_server_memory_usage')")) == "1" {
+					ready = true
+					break
+				}
+				time.Sleep(250 * time.Millisecond)
+			}
+			if !ready {
+				t.Fatal("migration test memory precondition not met after purge")
+			}
+		}
 		cmd := exec.Command(bin, args...)
 		cmd.Env = append(os.Environ(), "CLICKHOUSE_URL="+endpoint, "CLICKHOUSE_DB="+db, "CLICKHOUSE_USER=", "CLICKHOUSE_PASSWORD=", "CLICKHOUSE_PASSWORD_FILE=")
 		out, err := cmd.CombinedOutput()
