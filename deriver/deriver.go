@@ -48,12 +48,19 @@ func (d *deriver) setup(ctx context.Context) error {
 // rebuild truncates request_facts and derives everything again.
 func (d *deriver) rebuild(ctx context.Context) (int, error) {
 	// Validate before destructive writes. Writers and blob GC must be stopped for rebuild.
-	err := streamRows(ctx, d.ch, "SELECT DISTINCT request_id,started_at FROM "+d.db+".requests WHERE body_sha256!=repeat(char(0),32) SETTINGS max_threads=1", nil, func(r struct {
+	type row struct {
 		ID string `json:"request_id"`
 		TS string `json:"started_at"`
-	}) error { _, err := d.bodyReader().Read(ctx, r.ID, r.TS); return err })
+	}
+	var rows []row
+	err := selectRows(ctx, d.ch, "SELECT DISTINCT request_id,started_at FROM "+d.db+".requests WHERE body_sha256!=repeat(char(0),32) SETTINGS max_threads=1", nil, func(r row) { rows = append(rows, r) })
 	if err != nil {
-		return 0, fmt.Errorf("rebuild refused before truncate: %w", err)
+		return 0, err
+	}
+	for _, r := range rows {
+		if _, err := d.bodyReader().Read(ctx, r.ID, r.TS); err != nil {
+			return 0, fmt.Errorf("rebuild refused before truncate: %w", err)
+		}
 	}
 
 	if err := d.ch.exec(ctx, "TRUNCATE TABLE "+d.db+".request_facts", nil); err != nil {

@@ -28,7 +28,7 @@ func main() {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 	}
 	dryRun := flag.Bool("dry-run", false, "report migration size without writing rows")
-	rebuild := flag.Bool("rebuild", false, "truncate request_facts, derive all raw rows, then exit (stop the loop service first)")
+	rebuild := flag.Bool("rebuild", false, "truncate request_facts, derive all raw rows, then exit (stop capture, migrations, blob GC, and the loop first)")
 	interval := flag.Duration("interval", 30*time.Second, "time between passes")
 	batchRows := flag.Int("batch-rows", 16, "maximum bodies and facts per batch")
 	batchBytes := flag.Int("batch-bytes", 8<<20, "raw payload bytes per batch; one oversized row runs alone")
