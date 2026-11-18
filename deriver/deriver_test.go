@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Plana-Solutions/cpa-clickhouse-sink/bodystore"
 	"github.com/Plana-Solutions/cpa-clickhouse-sink/deriver/extract"
 )
 
@@ -434,6 +435,7 @@ func TestMigrateNewSkeleton(t *testing.T) {
 	if _, err := d.rebuild(ctx); err != nil {
 		t.Fatal(err)
 	}
+	prepareMigrationMemory(t, d)
 	dry, err := d.migrate(ctx, true)
 	if err != nil || dry.Rows != 2 {
 		t.Fatal(dry, err)
@@ -469,10 +471,27 @@ func TestRestoreKeepsSkeletonOnIncompleteBody(t *testing.T) {
 	if err := d.ch.exec(ctx, "ALTER TABLE "+testDB+".requests UPDATE request_body='',body_len=1,body_sha256=SHA256('x'),body_refs=[substring(SHA256('x'),1,16)],body_ref_offsets=[0] WHERE 1 SETTINGS mutations_sync=1", nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := d.restoreBodies(ctx, false); err == nil {
-		t.Fatal("accepted missing blob")
+	prepareMigrationMemory(t, d)
+	if _, err := d.restoreBodies(ctx, false); !errors.Is(err, bodystore.ErrIncomplete) {
+		t.Fatalf("expected missing blob, got %v", err)
 	}
 	if got := scalar(t, d, "SELECT countIf(body_len=1),countIf(request_body!='') FROM "+testDB+".requests"); got != "1\t0" {
 		t.Fatal("incomplete row changed", got)
 	}
+}
+
+// The shared integration server retains allocator pages from preceding test suites.
+func prepareMigrationMemory(t *testing.T, d *deriver) {
+	t.Helper()
+	ctx := context.Background()
+	if err := d.ch.exec(ctx, "SYSTEM JEMALLOC PURGE", nil); err != nil {
+		t.Fatal(err)
+	}
+	for attempt := 0; attempt < 20; attempt++ {
+		if err := d.migrationMemory(ctx, .60); err == nil {
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatal(d.migrationMemory(ctx, .60))
 }

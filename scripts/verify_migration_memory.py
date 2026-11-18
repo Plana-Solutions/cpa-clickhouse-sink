@@ -15,6 +15,8 @@ def docker(*args, **kwargs):
     return subprocess.check_output(["sudo", "-n", "docker", *args], **kwargs).decode().strip()
 results = []
 for side, binary in [("before", old), ("after", new)]:
+    if os.environ.get("MEMORY_AFTER_ONLY") == "1" and side == "before":
+        continue
     name = prefix + "-" + side
     network = name
     samples = []
@@ -78,7 +80,7 @@ for side, binary in [("before", old), ("after", new)]:
             docker("rm","-fv",migration_name)
             assert query("SELECT countIf(body_sha256=repeat(char(0),32)),count(),uniqExact(request_id) FROM cliproxy.requests") == "0\t600\t600"
             for request_id in query("SELECT request_id FROM cliproxy.requests").splitlines():
-                assert query("SELECT body_status FROM cliproxy.raw_request(id='" + request_id + "')") == "complete"
+                assert query("SELECT body_status,hex(SHA256(request_body)) FROM cliproxy.raw_request(id='" + request_id + "')") == "complete\t" + query("SELECT hex(body_sha256) FROM cliproxy.requests WHERE request_id='" + request_id + "'")
             print("migration resumed, 600/600 byte-exact request bodies verified",flush=True)
         log = logpath.read_text()
         # Logs contain only synthetic data and sanitized error messages.
