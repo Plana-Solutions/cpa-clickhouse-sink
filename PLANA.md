@@ -7,8 +7,7 @@ The upstream MIT license and attribution are retained in LICENSE and README.md.
 The plugin id remains `clickhouse-sink` and its host schema remains 7.
 
 Plana changes are the module import paths, release metadata, ARM64 release automation,
-and `CLICKHOUSE_PASSWORD_FILE` support in the deriver. Capture, redaction, and SQL
-behavior are inherited unchanged.
+and `CLICKHOUSE_PASSWORD_FILE` support in the deriver. Capture and redaction keep the host contract. Optional lossless item storage, dual-format reads, and migration are described in [BODY_STORAGE.md](BODY_STORAGE.md).
 
 ## Install from the plugin store
 
@@ -19,9 +18,9 @@ https://raw.githubusercontent.com/Plana-Solutions/cpa-clickhouse-sink/main/regis
 ```
 
 Refresh the store. Select **ClickHouse Sink (Plana ARM64)** from
-`Plana-Solutions/cpa-clickhouse-sink`, version `0.1.0-plana.2`.
+`Plana-Solutions/cpa-clickhouse-sink`, version `0.1.0-plana.3`.
 The release ZIP contains `clickhouse-sink.so`. Its name is
-`clickhouse-sink_0.1.0-plana.2_linux_arm64.zip`.
+`clickhouse-sink_0.1.0-plana.3_linux_arm64.zip`.
 `checksums.txt` lists ZIP hashes with bare filenames for CPA's installer.
 `SHA256SUMS` covers all other assets and `checksums.txt`.
 The deriver is a separate linux/arm64 binary. Building or publishing does not deploy it.

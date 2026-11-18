@@ -29,6 +29,7 @@ func TestBodyIntegration(t *testing.T) {
 		t.Fatal("DERIVER_BINARY required")
 	}
 	const db = "cliproxy_body_test"
+	runStarted := time.Now().UTC().Format("2006-01-02 15:04:05.000000")
 	query := func(ctx context.Context, q string, p map[string]string) (io.ReadCloser, error) {
 		vals := url.Values{"output_format_json_quote_64bit_integers": {"0"}, "max_threads": {"1"}, "max_memory_usage": {"1073741824"}}
 		for k, v := range p {
@@ -238,6 +239,7 @@ func TestBodyIntegration(t *testing.T) {
 	s.flushNow()
 	q("TRUNCATE TABLE " + db + ".request_facts")
 	q("TRUNCATE TABLE " + db + ".deriver_progress")
+	backlogStarted := time.Now().UTC().Format("2006-01-02 15:04:05.000000")
 	q("ALTER TABLE " + db + ".requests UPDATE ingested_at=now64(9)-INTERVAL 15 MINUTE WHERE 1 SETTINGS mutations_sync=1")
 	loopCtx, cancel := context.WithCancel(context.Background())
 	cmd := exec.CommandContext(loopCtx, bin, "--interval", "100ms")
@@ -267,7 +269,9 @@ func TestBodyIntegration(t *testing.T) {
 	q("SYSTEM FLUSH LOGS")
 	t.Logf("reconstructed=%d facts_equal=%d backlog=%d", len(rows), factsMatched, backlog)
 	t.Logf("sizes %s", q("SELECT table,sum(rows),sum(data_compressed_bytes),sum(bytes_on_disk) FROM system.parts WHERE active AND database='"+db+"' GROUP BY table ORDER BY table FORMAT TSV"))
-	t.Logf("peak_query_memory %s", q("SELECT max(memory_usage) FROM system.query_log WHERE type='QueryFinish' AND query LIKE '%"+db+"%' AND query NOT LIKE '%system.query_log%'"))
+	for _, measurement := range []struct{ name, since string }{{"peak_query_memory", runStarted}, {"peak_backlog_query_memory", backlogStarted}} {
+		t.Logf("%s %s", measurement.name, q("SELECT max(memory_usage) FROM system.query_log WHERE type='QueryFinish' AND query LIKE '%"+db+"%' AND query NOT LIKE '%system.query_log%' AND event_time_microseconds>=toDateTime64('"+measurement.since+"',6,'UTC')"))
+	}
 	q("TRUNCATE TABLE " + db + ".body_blobs")
 	if b, err := reader.Read(context.Background(), rows[0].RequestID); err == nil || b != nil {
 		t.Fatal("missing blob accepted")

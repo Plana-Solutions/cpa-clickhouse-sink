@@ -28,7 +28,7 @@ try:
     assert result["ok"] is True
     assert result["result"]["schema_version"] == 7
     assert result["result"]["metadata"]["Name"] == "clickhouse-sink"
-    assert result["result"]["metadata"]["Version"] == "0.1.0-plana.1"
+    assert result["result"]["metadata"]["Version"] == "0.1.0-plana.3"
 finally:
     api.free(out.ptr, out.length)
     api.shutdown()

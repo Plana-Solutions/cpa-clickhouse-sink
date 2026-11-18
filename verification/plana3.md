@@ -8,15 +8,15 @@ Both modules pass `go test -race ./...` and `go vet ./...`. The deriver integrat
 
 The live-shaped acceptance includes eight checked-in protocol fixtures, 36 live redacted rows fetched read-only, and an invalid UTF-8 body. The original 44 JSON-transportable rows contain 37,674,759 body bytes. Every body reconstructed byte-exact through `bodystore.Reader`, deriver fetching, and the SQL parameterized view. The 44 legacy and dedup fact rows matched after preserving ingestion order. Fact extraction depends on conversation order, so comparisons use equal original ingestion timestamps.
 
-Compressed fixture storage after `OPTIMIZE FINAL` was 14,650,515 bytes for legacy requests and 1,055,589 bytes for dedup requests plus blobs. This is a single acceptance dataset, about 13.9 times smaller. Responses remain inline. The dedup fixture set additionally contains a five-byte invalid UTF-8 body, which legacy JSONEachRow cannot preserve.
+Compressed fixture storage after `OPTIMIZE FINAL` was 14,650,521 bytes for legacy requests and 1,055,597 bytes for dedup requests plus blobs. This is a single acceptance dataset, about 13.9 times smaller. Responses remain inline. The dedup fixture set additionally contains a five-byte invalid UTF-8 body, which legacy JSONEachRow cannot preserve.
 
 The mixed-format migration converted 45 inline rows, including a row with no previous skeleton. Its rerun converted zero rows. A separate regression migrates a new skeleton with a 2 MiB residual, verifies its original bytes, and reruns idempotently. Missing or corrupt blobs return incomplete without returning partial content.
 
 ## Memory rehearsal
 
-The server cap was 1,503,238,553 bytes, or 1.4 GiB. HTTP queries additionally used a 1 GiB limit, and the deriver retained its default 256 MiB query cap and existing batch/pass limits. The loop caught up 3,200 dedup backlog rows with ingestion timestamps fifteen minutes before startup, alongside the live-shaped fixtures. All 3,246 facts landed with unique request IDs. Peak logged query memory across the entire acceptance run was 233,872,964 bytes, about 223 MiB. This includes legacy baseline and migration queries, rather than only dedup lookups.
+The server cap was 1,503,238,553 bytes, or 1.4 GiB. HTTP queries additionally used a 1 GiB limit, and the deriver retained its default 256 MiB query cap and existing batch/pass limits. The loop caught up 3,200 dedup backlog rows with ingestion timestamps fifteen minutes before startup, alongside the live-shaped fixtures. All 3,246 facts landed with unique request IDs. Peak logged query memory across the entire acceptance run was 232,527,487 bytes, about 222 MiB. This includes legacy baseline and migration queries, rather than only dedup lookups. During backlog catch-up alone, the peak was 19,775,627 bytes, about 18.9 MiB. These final-commit measurements use only query-log entries after the run and backlog start times.
 
-The run finished in 214.8 seconds, including both fact rebuilds, migration, and backlog catch-up. This is acceptance evidence, not a latency or throughput comparison. Other local agents were active. The test directory stayed below 0.4 GiB, and Data-volume free space stayed above 9 GiB.
+The run finished in 152.89 seconds, including both fact rebuilds, migration, and backlog catch-up. This is acceptance evidence, not a latency or throughput comparison. Other local agents were active. The test directory stayed below 0.4 GiB, and Data-volume free space stayed above 9 GiB.
 
 ## Isolated host check
 
@@ -40,3 +40,5 @@ The verifier removed every container and its network. The build used disposable 
 Real ClickHouse testing caught alias substitution in the hash lookup and migration filter, the 25.8 requirement to put comments before codecs, and the HTTP limit on large form values. The final implementation uses distinct projection aliases, a prefiltered migration source, an explicit skeleton existence check before deletion, compatible DDL ordering, and RowBinary external files for skeleton uploads. The large-residual regression and new-skeleton migration tests cover the delete-safety failure.
 
 Rollout instructions and config are in [BODY_STORAGE.md](../BODY_STORAGE.md). Deploy dual-format deriver and UI/export readers first, then enable the plugin flag, then run migration. Blob partition retention cannot follow request partition retention directly. External independent review is owned by the parent workflow; this implementation agent did not spawn reviewers.
+
+The initial native ARM64 workflow passed vet and race tests but failed its ABI assertion because the release verifier still expected the old plugin version. The assertion and registry now name v0.1.0-plana.3.
