@@ -3,9 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
+	"strings"
 	"time"
 
+	"github.com/Plana-Solutions/cpa-clickhouse-sink/bodystore"
 	"github.com/Plana-Solutions/cpa-clickhouse-sink/deriver/extract"
 	"github.com/Plana-Solutions/cpa-clickhouse-sink/redact"
 )
@@ -31,7 +34,10 @@ func newDeriver(ch *clickhouse, db string, log *slog.Logger, r *redact.Redactor)
 
 // setup creates the derived table and views.
 func (d *deriver) setup(ctx context.Context) error {
-	for _, stmt := range schemaFor(derivedSchema, d.db) {
+	for _, stmt := range schemaFor(append(strings.Split(bodystore.Schema, "\n;\n"), derivedSchema...), d.db) {
+		if strings.TrimSpace(stmt) == "" {
+			continue
+		}
 		if err := d.ch.exec(ctx, stmt, nil); err != nil {
 			return err
 		}
@@ -198,7 +204,7 @@ func (d *deriver) candidates(ctx context.Context, lower, upper, cursorTS, cursor
 	q := `WITH (SELECT min(ingested_at) + INTERVAL 1 HOUR FROM ` + d.db + `.requests
  WHERE ingested_at >= {lower:DateTime64(9, 'UTC')} AND ingested_at < {upper:DateTime64(9, 'UTC')}
  AND (ingested_at, request_id) > ({cts:DateTime64(9, 'UTC')}, {cid:String})) AS window_upper
-SELECT request_id, ingested_at
+SELECT DISTINCT request_id, ingested_at
 FROM ` + d.db + `.requests
 WHERE ingested_at >= {lower:DateTime64(9, 'UTC')} AND ingested_at < {upper:DateTime64(9, 'UTC')}
  AND ingested_at < window_upper
@@ -233,21 +239,43 @@ ORDER BY ingested_at, request_id LIMIT {limit:UInt32} SETTINGS max_threads=1`
 		return rows, &last, nil
 	}
 	sizes := map[string]uint64{}
-	err = selectRows(ctx, d.ch, `SELECT request_id, length(request_body)+length(response_body)+arraySum(arrayMap(x -> length(x),response_chunks))+length(toJSONString(request_headers))+length(error) AS bytes FROM `+d.db+`.requests PREWHERE request_id IN {ids:Array(String)} SETTINGS max_threads=1, max_block_size=1, preferred_block_size_bytes=1048576`, map[string]string{"ids": chArray(ids)}, func(r candidate) { sizes[r.RequestID] = r.Bytes })
+	err = selectRows(ctx, d.ch, `SELECT request_id, body_len+length(request_body)+length(response_body)+arraySum(arrayMap(x -> length(x),response_chunks))+length(toJSONString(request_headers))+length(error) AS bytes FROM `+d.db+`.requests PREWHERE request_id IN {ids:Array(String)} SETTINGS max_threads=1, max_block_size=1, preferred_block_size_bytes=1048576`, map[string]string{"ids": chArray(ids)}, func(r candidate) { sizes[r.RequestID] = r.Bytes })
 	for i := range rows {
 		rows[i].Bytes = sizes[rows[i].RequestID]
 	}
 	return rows, &last, err
 }
 
+func (d *deriver) bodyReader() bodystore.Reader {
+	return bodystore.Reader{Database: d.db, Query: func(ctx context.Context, q string, p map[string]string) (io.ReadCloser, error) {
+		return d.ch.do(ctx, q, p, nil)
+	}}
+}
+
 func (d *deriver) fetch(ctx context.Context, ids []string, fn func(extract.Row) error) error {
+	blobs, err := d.bodyReader().Load(ctx, ids)
+	if err != nil {
+		return err
+	}
 	q := `SELECT request_id, trace_id, started_at, ingested_at,
  duration_ms, path, source_format, model, stream, outcome, status_code, error,
- request_headers, request_body, response_body, response_chunks, redaction_count
+ request_headers, response_body, response_chunks, redaction_count, ` + bodystore.Projection + `
 FROM ` + d.db + `.requests PREWHERE request_id IN {ids:Array(String)}
-ORDER BY ingested_at, request_id
+ORDER BY ingested_at, request_id, request_body = '' DESC
+LIMIT 1 BY request_id
 SETTINGS max_threads=1, max_block_size=1, preferred_block_size_bytes=1048576`
-	return streamRows(ctx, d.ch, q, map[string]string{"ids": chArray(ids)}, fn)
+	type stored struct {
+		extract.Row
+		bodystore.Body
+	}
+	return streamRows(ctx, d.ch, q, map[string]string{"ids": chArray(ids)}, func(r stored) error {
+		body, err := r.Body.Restore(blobs)
+		if err != nil {
+			return fmt.Errorf("request %s: %w", r.RequestID, err)
+		}
+		r.Row.RequestBody = string(body)
+		return fn(r.Row)
+	})
 }
 
 func (d *deriver) knownConversations(ctx context.Context, ids []string) (map[string]bool, error) {
