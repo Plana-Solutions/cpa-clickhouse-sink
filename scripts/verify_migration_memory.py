@@ -79,8 +79,8 @@ for side, binary in [("before", old), ("after", new)]:
             assert migrating.wait(timeout=600) == 0, "resume failed"
             docker("rm","-fv",migration_name)
             assert query("SELECT countIf(body_sha256=repeat(char(0),32)),count(),uniqExact(request_id) FROM cliproxy.requests") == "0\t600\t600"
-            for request_id in query("SELECT request_id FROM cliproxy.requests").splitlines():
-                assert query("SELECT body_status,hex(SHA256(request_body)) FROM cliproxy.raw_request(id='" + request_id + "')") == "complete\t" + query("SELECT hex(body_sha256) FROM cliproxy.requests WHERE request_id='" + request_id + "'")
+            checker = '\nimport json,sys,urllib.request\nurl="http://"+sys.argv[1]+":8123/?http_write_exception_in_output_format=0&max_threads=1"\ndef q(sql):\n    with urllib.request.urlopen(urllib.request.Request(url,data=sql.encode()),timeout=60) as r:\n        return r.read().decode().strip()\nrows=[json.loads(line) for line in q("SELECT request_id,hex(body_sha256) sha FROM cliproxy.requests FORMAT JSONEachRow").splitlines()]\nassert len(rows)==600\nfor row in rows:\n    assert q("SELECT body_status,hex(SHA256(request_body)) FROM cliproxy.raw_request(id=\'"+row["request_id"]+"\')") == "complete\\t"+row["sha"],row["request_id"]\nprint("600/600 SQL bodies match the original SHA-256")\n'
+            print(docker("run","--rm","--network",network,"python:3.12-slim","python","-c",checker,name),flush=True)
             print("migration resumed, 600/600 byte-exact request bodies verified",flush=True)
         log = logpath.read_text()
         # Logs contain only synthetic data and sanitized error messages.
