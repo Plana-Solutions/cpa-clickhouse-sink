@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 zip_path="$(realpath "$1")"
+deriver_path="$(realpath "$2")"
 prefix="plana-ch-release-$(date +%s)-$$"
 work="$(mktemp -d "$HOME/plana-ch-release.XXXXXX")"
 containers=()
@@ -89,5 +90,18 @@ done
 [[ "$rows" == 3 ]]
 usage=$(sudo -n docker exec "$prefix-ch" clickhouse-client --password isolated-release-clickhouse --query 'SELECT count() FROM cliproxy.usage')
 [[ "$usage" -ge 3 ]]
-echo "Production-image load verified. requests=$rows usage=$usage"
+cp "$deriver_path" "$work/deriver"
+printf '%s\n' 'isolated-release-clickhouse' > "$work/password"
+chmod a+rx "$work" "$work/deriver"
+chmod a+r "$work/password"
+containers+=("$prefix-deriver")
+sudo -n docker run -d --name "$prefix-deriver" --network "$prefix" -v "$work/deriver:/deriver:ro" -v "$work/password:/run/secrets/ch_writer:ro" -e CLICKHOUSE_URL="http://$prefix-ch:8123" -e CLICKHOUSE_USER=default -e CLICKHOUSE_PASSWORD_FILE=/run/secrets/ch_writer cpa-local/clickhouse-deriver:60b5048 --interval 1s >/dev/null
+for attempt in $(seq 1 60); do
+  facts=$(sudo -n docker exec "$prefix-ch" clickhouse-client --password isolated-release-clickhouse --query 'SELECT count() FROM cliproxy.request_facts' 2>/dev/null || true)
+  if [[ "$facts" == 3 ]]; then break; fi
+  sleep 1
+done
+[[ "$facts" == 3 ]]
+echo "Production-image load verified. requests=$rows usage=$usage request_facts=$facts"
+echo "Released deriver verified in stock distroless image with mounted password file."
 sudo -n docker logs "$prefix-cpa" 2>&1 | grep -E 'clickhouse-sink|plugin.*load' | tail -10
