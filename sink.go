@@ -40,6 +40,7 @@ type sinkConfig struct {
 	Username    string
 	Password    string
 	StoreBodies bool
+	BodyDedup   bool
 	// SecretFiles and DisabledRules configure redaction (see redact.go).
 	SecretFiles   []string
 	DisabledRules []string
@@ -47,7 +48,7 @@ type sinkConfig struct {
 
 func (c sinkConfig) equal(o sinkConfig) bool {
 	return c.URL == o.URL && c.Database == o.Database && c.Username == o.Username &&
-		c.Password == o.Password && c.StoreBodies == o.StoreBodies &&
+		c.Password == o.Password && c.StoreBodies == o.StoreBodies && c.BodyDedup == o.BodyDedup &&
 		strings.Join(c.SecretFiles, "\x00") == strings.Join(o.SecretFiles, "\x00") &&
 		strings.Join(c.DisabledRules, "\x00") == strings.Join(o.DisabledRules, "\x00")
 }
@@ -56,10 +57,12 @@ func (c sinkConfig) equal(o sinkConfig) bool {
 // retry after an ambiguous failure is deduplicated by ClickHouse
 // (insert_deduplication_token + non_replicated_deduplication_window).
 type batch struct {
-	table string
-	rows  [][]byte
-	token string
-	size  int
+	format  string
+	columns string
+	table   string
+	rows    [][]byte
+	token   string
+	size    int
 }
 
 func newBatch(table string, rows [][]byte) batch {
@@ -75,14 +78,19 @@ func newBatch(table string, rows [][]byte) batch {
 
 // sink batches JSONEachRow rows per table and inserts them over HTTP.
 type sink struct {
-	mu        sync.Mutex
-	cfg       sinkConfig
-	pending   map[string][][]byte
-	retry     []batch
-	buffered  int
-	dropped   int
-	schemaOK  bool
-	lastError string
+	bodyPending                []bodyRequest
+	bodyPendingSize            int
+	bodyRetry                  *bodyUnit
+	known                      map[uint64]*knownLineage
+	blobsWritten, blobsSkipped int
+	mu                         sync.Mutex
+	cfg                        sinkConfig
+	pending                    map[string][][]byte
+	retry                      []batch
+	buffered                   int
+	dropped                    int
+	schemaOK                   bool
+	lastError                  string
 
 	client *http.Client
 	kick   chan struct{}
@@ -102,10 +110,13 @@ func newSink(cfg sinkConfig) *sink {
 }
 
 func (s *sink) reconfigure(cfg sinkConfig) {
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.cfg.equal(cfg) {
 		s.cfg = cfg
+		s.known = nil
 		s.schemaOK = false
 	}
 }
@@ -189,7 +200,10 @@ func (s *sink) flushNow() {
 	if dropped > 0 {
 		logf("buffer full, dropped %d rows", dropped)
 	}
-	if len(batches) == 0 {
+	s.mu.Lock()
+	hasBodies := s.bodyRetry != nil || len(s.bodyPending) > 0
+	s.mu.Unlock()
+	if len(batches) == 0 && !hasBodies {
 		return
 	}
 	if !schemaOK {
@@ -203,6 +217,11 @@ func (s *sink) flushNow() {
 			s.schemaOK = true
 		}
 		s.mu.Unlock()
+	}
+	if err := s.flushBodies(cfg); err != nil {
+		s.keep(batches)
+		s.report(err)
+		return
 	}
 	for i, b := range batches {
 		if errInsert := s.insertBatch(cfg, b); errInsert != nil {
@@ -234,6 +253,8 @@ func (s *sink) insertBatch(cfg sinkConfig, b batch) error {
 	mid := len(b.rows) / 2
 	for _, half := range [][][]byte{b.rows[:mid], b.rows[mid:]} {
 		part := newBatch(b.table, half)
+		part.format = b.format
+		part.columns = b.columns
 		if errPart := s.insertBatch(cfg, part); errPart != nil {
 			return errPart
 		}
@@ -288,11 +309,23 @@ func (s *sink) ensureSchema(cfg sinkConfig) error {
 }
 
 func (s *sink) insert(cfg sinkConfig, b batch) error {
+	format := b.format
+	if format == "" {
+		format = "JSONEachRow"
+	}
+	table := cfg.Database + "." + b.table
+	if b.columns != "" {
+		table += " (" + b.columns + ")"
+	}
 	params := url.Values{
-		"query":                      {fmt.Sprintf("INSERT INTO %s.%s FORMAT JSONEachRow", cfg.Database, b.table)},
+		"query":                      {fmt.Sprintf("INSERT INTO %s FORMAT %s", table, format)},
 		"insert_deduplication_token": {b.token},
 	}
-	body := bytes.Join(b.rows, []byte{'\n'})
+	sep := []byte{'\n'}
+	if b.format == "RowBinary" {
+		sep = nil
+	}
+	body := bytes.Join(b.rows, sep)
 	if errExec := s.exec(cfg, params, string(body)); errExec != nil {
 		return fmt.Errorf("insert %d rows into %s: %w", len(b.rows), b.table, errExec)
 	}

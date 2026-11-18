@@ -1,0 +1,253 @@
+package main
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/Plana-Solutions/cpa-clickhouse-sink/bodystore"
+)
+
+type bodyRequest struct {
+	row     requestRow
+	lineage uint64
+	sk      bodystore.Skeleton
+	blobs   map[bodystore.Hash][]byte
+}
+type bodyUnit struct {
+	requests    []bodyRequest
+	blobs, rows *batch
+	keys        []bodystore.Key
+	size        int
+}
+type knownLineage struct {
+	hashes map[bodystore.Hash]bool
+	used   time.Time
+}
+
+func (s *sink) addRequest(row requestRow) {
+	s.mu.Lock()
+	enabled := s.cfg.BodyDedup
+	s.mu.Unlock()
+	if !enabled {
+		s.add(tableRequests, row)
+		return
+	}
+	body := []byte(row.RequestBody)
+	r := bodyRequest{row: row, lineage: bodystore.Lineage(row.RequestHeaders, body)}
+	r.sk, r.blobs = bodystore.Split(body)
+	r.row.RequestBody = ""
+	size := len(encodeBodyRequest(r))
+	for _, v := range r.blobs {
+		size += len(v) + 40
+	}
+	s.mu.Lock()
+	if s.buffered+size > maxBufferedBytes {
+		s.dropped++
+		s.mu.Unlock()
+		return
+	}
+	s.bodyPending = append(s.bodyPending, r)
+	s.bodyPendingSize += size
+	s.buffered += size
+	full := s.buffered >= flushBytes
+	s.mu.Unlock()
+	if full {
+		select {
+		case s.kick <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// Only the flush goroutine owns the acknowledged-hash cache.
+func (s *sink) lineage(cfg sinkConfig, l uint64) *knownLineage {
+	now := time.Now()
+	if s.known == nil {
+		s.known = map[uint64]*knownLineage{}
+	}
+	for k, e := range s.known {
+		if now.Sub(e.used) > 24*time.Hour {
+			delete(s.known, k)
+		}
+	}
+	if e := s.known[l]; e != nil {
+		e.used = now
+		return e
+	}
+	if len(s.known) >= 512 {
+		var oldest uint64
+		var ts time.Time
+		for k, e := range s.known {
+			if ts.IsZero() || e.used.Before(ts) {
+				oldest = k
+				ts = e.used
+			}
+		}
+		delete(s.known, oldest)
+	}
+	e := &knownLineage{hashes: map[bodystore.Hash]bool{}, used: now}
+	s.known[l] = e
+	if l == 0 {
+		return e
+	}
+	req, err := http.NewRequest(http.MethodPost, cfg.URL+"/", strings.NewReader(fmt.Sprintf("SELECT hex(hash) AS hash FROM %s.body_blobs WHERE lineage = %d LIMIT 100000 FORMAT JSONEachRow", cfg.Database, l)))
+	if err != nil {
+		return e
+	}
+	req.SetBasicAuth(cfg.Username, cfg.Password)
+	resp, err := s.client.Do(req)
+	if err != nil {
+		logf("body preload failed")
+		return e
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		logf("body preload failed")
+		return e
+	}
+	dec := json.NewDecoder(resp.Body)
+	hashes := map[bodystore.Hash]bool{}
+	for {
+		var row struct {
+			Hash string `json:"hash"`
+		}
+		err := dec.Decode(&row)
+		if err == io.EOF {
+			e.hashes = hashes
+			break
+		}
+		if err != nil {
+			logf("body preload failed")
+			break
+		}
+		b, err := hex.DecodeString(row.Hash)
+		if err != nil || len(b) != 16 {
+			break
+		}
+		hashes[bodystore.Hash(b)] = true
+	}
+	return e
+}
+
+func binaryBatch(table, columns string, rows [][]byte) *batch {
+	b := newBatch(table, rows)
+	b.format = "RowBinary"
+	b.columns = columns
+	return &b
+}
+
+func (s *sink) prepareBodies(cfg sinkConfig, u *bodyUnit) {
+	rows := [][]byte{}
+	seen := map[bodystore.Key]bool{}
+	for _, r := range u.requests {
+		e := s.lineage(cfg, r.lineage)
+		hs := make([]bodystore.Hash, 0, len(r.blobs))
+		for h := range r.blobs {
+			hs = append(hs, h)
+		}
+		sort.Slice(hs, func(i, j int) bool { return string(hs[i][:]) < string(hs[j][:]) })
+		for _, h := range hs {
+			k := bodystore.Key{Lineage: r.lineage, Hash: h}
+			if e.hashes[h] || seen[k] {
+				s.blobsSkipped++
+				continue
+			}
+			seen[k] = true
+			u.keys = append(u.keys, k)
+			rows = append(rows, encodeBlob(r.lineage, h, r.blobs[h], r.row.StartedAt))
+		}
+	}
+	u.blobs = binaryBatch("body_blobs", "lineage,hash,data,first_seen", rows)
+}
+
+// Bad blob rows fall back to inline requests. Transient failures keep immutable tokens.
+func (s *sink) insertBlobs(cfg sinkConfig, b batch, keys []bodystore.Key, bad map[bodystore.Key]bool) error {
+	if len(b.rows) == 0 {
+		return nil
+	}
+	err := s.insert(cfg, b)
+	if err == nil {
+		for _, k := range keys {
+			e := s.lineage(cfg, k.Lineage)
+			if len(e.hashes) < 100000 {
+				e.hashes[k.Hash] = true
+			}
+		}
+		s.blobsWritten += len(keys)
+		return nil
+	}
+	if !isBadData(err) {
+		return err
+	}
+	if len(b.rows) == 1 {
+		bad[keys[0]] = true
+		return nil
+	}
+	mid := len(b.rows) / 2
+	for _, rng := range [][2]int{{0, mid}, {mid, len(b.rows)}} {
+		part := binaryBatch(b.table, b.columns, b.rows[rng[0]:rng[1]])
+		if err := s.insertBlobs(cfg, *part, keys[rng[0]:rng[1]], bad); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *sink) flushBodies(cfg sinkConfig) error {
+	for {
+		s.mu.Lock()
+		u := s.bodyRetry
+		if u == nil && len(s.bodyPending) > 0 {
+			u = &bodyUnit{requests: s.bodyPending, size: s.bodyPendingSize}
+			s.bodyPending = nil
+			s.bodyPendingSize = 0
+			s.bodyRetry = u
+		}
+		s.mu.Unlock()
+		if u == nil {
+			return nil
+		}
+		if u.rows == nil {
+			if u.blobs == nil {
+				s.prepareBodies(cfg, u)
+			}
+			bad := map[bodystore.Key]bool{}
+			if err := s.insertBlobs(cfg, *u.blobs, u.keys, bad); err != nil {
+				return err
+			}
+			rows := make([][]byte, 0, len(u.requests))
+			for _, r := range u.requests {
+				for _, h := range r.sk.Refs {
+					if bad[bodystore.Key{Lineage: r.lineage, Hash: h}] {
+						body, err := bodystore.Join(r.sk, r.blobs)
+						if err != nil {
+							return err
+						}
+						r.row.RequestBody = string(body)
+						r.sk = bodystore.Skeleton{}
+						break
+					}
+				}
+				rows = append(rows, encodeBodyRequest(r))
+			}
+			u.rows = binaryBatch("requests", bodyRequestColumns, rows)
+			u.blobs = nil
+			u.requests = nil
+			u.keys = nil
+		}
+		if err := s.insertBatch(cfg, *u.rows); err != nil {
+			return err
+		}
+		s.release(u.size)
+		s.mu.Lock()
+		s.bodyRetry = nil
+		s.mu.Unlock()
+		logf("body blobs written=%d skipped=%d", s.blobsWritten, s.blobsSkipped)
+	}
+}

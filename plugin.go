@@ -14,7 +14,7 @@ import (
 
 const (
 	pluginName    = "clickhouse-sink"
-	pluginVersion = "0.1.0-plana.1"
+	pluginVersion = "0.1.0-plana.3"
 	// schemaVersion 7 is the oldest host contract that omits request bodies
 	// on after-auth interception and on stream payload chunks; newer hosts
 	// accept older plugin schemas.
@@ -32,6 +32,7 @@ type pluginConfig struct {
 	Username    string `yaml:"username"`
 	Password    string `yaml:"password"`
 	StoreBodies *bool  `yaml:"store-bodies"`
+	BodyDedup   bool   `yaml:"body-dedup"`
 	// RedactFiles lists files or directories whose secrets are redacted.
 	RedactFiles []string `yaml:"redact-files"`
 	// RedactDisabledRules turns off gitleaks rule IDs that misfire.
@@ -54,6 +55,7 @@ func parseConfig(raw []byte) (sinkConfig, error) {
 		Username:      strings.TrimSpace(cfg.Username),
 		Password:      cfg.Password,
 		StoreBodies:   cfg.StoreBodies == nil || *cfg.StoreBodies,
+		BodyDedup:     cfg.BodyDedup,
 		SecretFiles:   cfg.RedactFiles,
 		DisabledRules: cfg.RedactDisabledRules,
 	}
@@ -95,6 +97,7 @@ const registration = `{
     "Author": "api-token / Plana-Solutions",
     "GitHubRepository": "https://github.com/Plana-Solutions/cpa-clickhouse-sink",
     "ConfigFields": [
+      {"Name": "body-dedup", "Type": "boolean", "Default": false, "Description": "Store repeated request items once. Deploy dual-format readers first."},
       {"Name": "url", "Type": "string", "Default": %q, "Description": "ClickHouse HTTP endpoint."},
       {"Name": "database", "Type": "string", "Default": %q, "Description": "Database for the requests and usage tables. Created on startup."},
       {"Name": "username", "Type": "string", "Default": %q, "Description": "ClickHouse user."},
@@ -241,7 +244,7 @@ func (p *plugin) handle(method string, request []byte) (json.RawMessage, error) 
 		if s := p.currentSink(); s != nil && (row.Model != "" || row.RequestedModel != "") {
 			// Redact before the row reaches any buffer, so no layer holds a secret.
 			redactRequest(p.currentRedactor(), &row)
-			s.add(tableRequests, row)
+			s.addRequest(row)
 		}
 		return emptyResult, nil
 
