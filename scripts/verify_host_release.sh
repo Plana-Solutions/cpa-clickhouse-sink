@@ -72,7 +72,7 @@ PY
 sudo -n docker network create --internal "$prefix" >/dev/null
 network_created=true
 containers+=("$prefix-ch")
-sudo -n docker run -d --name "$prefix-ch" --network "$prefix" -e CLICKHOUSE_PASSWORD=isolated-release-clickhouse --memory 1503238553 clickhouse/clickhouse-server:25.8@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77 >/dev/null
+sudo -n docker run -d --name "$prefix-ch" --network "$prefix" -e CLICKHOUSE_PASSWORD=isolated-release-clickhouse -e CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1 --memory 1503238553 clickhouse/clickhouse-server:25.8@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77 >/dev/null
 containers+=("$prefix-fake")
 sudo -n docker run -d --name "$prefix-fake" --network "$prefix" -v "$work:/verify:ro" python:3.12-slim python /verify/fake.py >/dev/null
 for attempt in $(seq 1 60); do
@@ -92,15 +92,16 @@ done
 [[ "$rows" == 3 ]]
 usage=$(sudo -n docker exec "$prefix-ch" clickhouse-client --password isolated-release-clickhouse --query 'SELECT count() FROM cliproxy.usage')
 [[ "$usage" -ge 3 ]]
-# Rotate the throwaway writer while capture continues, then hot-reload its corrected config.
-sudo -n docker exec "$prefix-ch" clickhouse-client --password isolated-release-clickhouse --query "ALTER USER sink IDENTIFIED BY 'isolated-release-rotated'"
+# Keep a failed body unit queued before rotating credentials and hot-reloading config.
+sudo -n docker exec "$prefix-ch" clickhouse-client --password isolated-release-clickhouse --query "REVOKE INSERT ON cliproxy.body_blobs FROM sink"
 containers+=("$prefix-rotation-client")
 sudo -n docker run --name "$prefix-rotation-client" --network "$prefix" -v "$work:/verify:ro" python:3.12-slim python /verify/client.py "$prefix-cpa" rotation
 for attempt in $(seq 1 30); do
-  if sudo -n docker logs "$prefix-cpa" 2>&1 | grep -q 'rows kept for retry'; then break; fi
+  if sudo -n docker logs "$prefix-cpa" 2>&1 | grep -q 'insert .*body_blobs.*rows kept for retry'; then break; fi
   sleep 1
 done
-sudo -n docker logs "$prefix-cpa" 2>&1 | grep 'rows kept for retry'
+sudo -n docker logs "$prefix-cpa" 2>&1 | grep 'insert .*body_blobs.*rows kept for retry'
+sudo -n docker exec "$prefix-ch" clickhouse-client --password isolated-release-clickhouse --multiquery --query "ALTER USER sink IDENTIFIED BY 'isolated-release-rotated'; GRANT INSERT ON cliproxy.body_blobs TO sink"
 python3 - "$work/cpa/config.yaml" <<'PYROTATE'
 import sys
 from pathlib import Path
