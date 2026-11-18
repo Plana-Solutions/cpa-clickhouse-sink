@@ -35,19 +35,24 @@ jobs:
           (cd deriver && go build -o /tmp/clickhouse-deriver .)
           go vet ./...
           go test -race -count=1 -timeout 15m -v ./...
-      - name: Reset the disposable server between integration suites
+      - name: Start a fresh capped server for the memory-sensitive tests
         run: |
-          docker restart "${{ job.services.clickhouse.id }}"
+          docker stop "${{ job.services.clickhouse.id }}"
+          docker run -d --name deriver-${{ github.run_id }} --memory 1503238553 -e CLICKHOUSE_SKIP_USER_SETUP=1 -p 127.0.0.1:18123:8123 clickhouse/clickhouse-server:25.8@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77
           for attempt in $(seq 1 60); do
-            if curl --fail --silent http://127.0.0.1:8123/ --data-binary 'SELECT 1' > /dev/null; then break; fi
+            if curl --fail --silent http://127.0.0.1:18123/ --data-binary 'SELECT 1' > /dev/null; then break; fi
             sleep 1
           done
-          curl --fail --silent http://127.0.0.1:8123/ --data-binary 'SELECT 1'
+          curl --fail --silent http://127.0.0.1:18123/ --data-binary 'SELECT 1'
       - name: Deriver integration tests
         env:
           DERIVER_INTEGRATION: '1'
-          CLICKHOUSE_URL: http://127.0.0.1:8123
+          CLICKHOUSE_URL: http://127.0.0.1:18123
         run: |
           cd deriver
           go vet ./...
-          go test -race -count=1 -timeout 10m -v ./...
+          go test -race -count=1 -timeout 10m -v -run 'TestMigrateNewSkeleton|TestRestoreKeepsSkeletonOnIncompleteBody' .
+          go test -race -count=1 -timeout 10m -v -skip 'TestMigrateNewSkeleton|TestRestoreKeepsSkeletonOnIncompleteBody' ./...
+      - name: Remove the additional server and its volumes
+        if: always()
+        run: docker rm -fv deriver-${{ github.run_id }}
