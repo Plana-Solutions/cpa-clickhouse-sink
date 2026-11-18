@@ -12,6 +12,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -36,6 +37,22 @@ jobs:
           else:
               raise SystemExit('Release exists. Cut a new tag instead of replacing assets.')
           PYRELEASE
+      - name: Resolve and cross-check release identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          export PLUGIN_VERSION="$(python3 -c 'import json;print(json.load(open("registry.json"))["plugins"][0]["version"])')"
+          python3 scripts/verify_release.py
+          echo "PLUGIN_VERSION=$PLUGIN_VERSION" >> "$GITHUB_ENV"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            python3 - <<'PYTESTS'
+          import json, os, urllib.request
+          url = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/actions/workflows/test.yml/runs?head_sha=' + os.environ['GITHUB_SHA'] + '&per_page=100'
+          req = urllib.request.Request(url, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN']})
+          runs = json.load(urllib.request.urlopen(req))['workflow_runs']
+          assert any(r['head_sha'] == os.environ['GITHUB_SHA'] and r['conclusion'] == 'success' for r in runs), 'Tests must pass for tagged commit before publication'
+          PYTESTS
+          fi
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
         with:
           go-version-file: go.mod
@@ -52,16 +69,15 @@ jobs:
       - name: Build and verify native plugin ABI
         run: |
           mkdir dist
-          CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -buildmode=c-shared -o dist/clickhouse-sink.so .
+          CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -buildmode=c-shared -ldflags "-X main.pluginVersion=$PLUGIN_VERSION" -o dist/clickhouse-sink.so .
           (cd deriver && CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -o ../dist/clickhouse-deriver-linux-arm64 .)
           file dist/clickhouse-sink.so dist/clickhouse-deriver-linux-arm64
-          python3 scripts/verify_arm64_release.py
+          python3 scripts/verify_arm64_release.py dist/clickhouse-sink.so
       - name: Package for CLIProxyAPI plugin store
         shell: bash
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          if [[ "$GITHUB_REF_TYPE" != tag ]]; then version="0.1.0-plana.4"; fi
+          version="$PLUGIN_VERSION"
           (
             cd dist
             zip -X "clickhouse-sink_${version}_linux_arm64.zip" clickhouse-sink.so
@@ -69,6 +85,7 @@ jobs:
             sha256sum -- *.so *.h clickhouse-deriver-linux-arm64 *.zip checksums.txt > SHA256SUMS
             sha256sum --check SHA256SUMS
           )
+          python3 scripts/verify_release.py dist
       - uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
         with:
           name: clickhouse-sink-linux-arm64

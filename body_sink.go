@@ -104,7 +104,7 @@ func (s *sink) lineage(ctx context.Context, cfg sinkConfig, l uint64) *knownLine
 	}
 	ctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.URL+"/", strings.NewReader(fmt.Sprintf("SELECT hex(hash) AS hash FROM %s.body_blobs WHERE lineage = %d LIMIT 100000 FORMAT JSONEachRow", cfg.Database, l)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.URL+"/?http_write_exception_in_output_format=0", strings.NewReader(fmt.Sprintf("SELECT hex(hash) AS hash FROM %s.body_blobs WHERE lineage = %d LIMIT 100000 FORMAT JSONEachRow", cfg.Database, l)))
 	if err != nil {
 		return e
 	}
@@ -252,6 +252,19 @@ func (s *sink) flushBodies(cfg sinkConfig) error {
 				return err
 			}
 			u.schemaOK = true
+		}
+		if u.rows == nil && !u.cfg.BodyDedup {
+			rows := make([][]byte, 0, len(u.requests))
+			for _, r := range u.requests {
+				body, err := bodystore.Join(r.sk, r.blobs)
+				if err != nil {
+					return err
+				}
+				r.row.RequestBody = string(body)
+				r.sk = bodystore.Skeleton{}
+				rows = append(rows, encodeBodyRequest(r))
+			}
+			u.rows = binaryBatch("requests", bodyRequestColumns, rows)
 		}
 		if u.rows == nil {
 			if u.blobs == nil {

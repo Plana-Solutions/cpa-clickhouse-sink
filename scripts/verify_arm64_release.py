@@ -1,5 +1,7 @@
 import ctypes
 import json
+import os
+import sys
 
 
 class Buffer(ctypes.Structure):
@@ -15,7 +17,7 @@ class PluginAPI(ctypes.Structure):
     _fields_ = [("version", ctypes.c_uint32), ("call", Call), ("free", Free), ("shutdown", Shutdown)]
 
 
-plugin = ctypes.CDLL("./dist/clickhouse-sink.so")
+plugin = ctypes.CDLL(os.path.abspath(sys.argv[1]))
 plugin.cliproxy_plugin_init.argtypes = [ctypes.c_void_p, ctypes.POINTER(PluginAPI)]
 plugin.cliproxy_plugin_init.restype = ctypes.c_int
 api = PluginAPI()
@@ -28,9 +30,9 @@ try:
     assert result["ok"] is True
     assert result["result"]["schema_version"] == 7
     assert result["result"]["metadata"]["Name"] == "clickhouse-sink"
-    assert result["result"]["metadata"]["Version"] == "0.1.0-plana.3"
+    assert result["result"]["metadata"]["Version"] == os.environ["PLUGIN_VERSION"]
 finally:
     api.free(out.ptr, out.length)
     api.shutdown()
 
-print("ARM64 native plugin ABI verified, clickhouse-sink schema 7")
+print("Native plugin ABI verified, schema 7, version " + os.environ["PLUGIN_VERSION"])

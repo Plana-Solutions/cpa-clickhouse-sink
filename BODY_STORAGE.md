@@ -67,3 +67,5 @@ The loop writes metadata-only facts with `parse_status='body_incomplete'` when r
 Both plugin and deriver execute schema DDL even with dedup disabled. The writer needs SELECT, INSERT, CREATE TABLE, ALTER TABLE, CREATE VIEW, and DROP VIEW in the target database. Migration and restore also need ALTER DELETE. The existing production grant `GRANT ALL ON cliproxy.* TO cliproxy` covers this release. This document does not change grants or production settings.
 
 Release tags and uploaded assets are immutable. Cut a new version for every changed binary, never force-move a tag or replace an existing release. Pin downloads by the full SHA-256 in the release's `SHA256SUMS`, verify the manifest and every downloaded asset before installation, and record the tag's commit. The release job refuses to publish over an existing release. ClickHouse 25.8 CI and the host test pin the service image by digest.
+
+Blob repair must use `INSERT INTO cliproxy.body_blobs ... SETTINGS insert_deduplicate=0 FORMAT RowBinary` so ClickHouse accepts a previously deleted blob. Stop writers before repair and restart them after repair to discard their caches.

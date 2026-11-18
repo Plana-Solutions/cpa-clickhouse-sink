@@ -320,6 +320,9 @@ func (s *sink) insert(cfg sinkConfig, b batch) error {
 		"query":                      {fmt.Sprintf("INSERT INTO %s FORMAT %s", table, format)},
 		"insert_deduplication_token": {b.token},
 	}
+	if b.format == "RowBinary" {
+		params.Set("insert_deduplicate", "0")
+	}
 	sep := []byte{'\n'}
 	if b.format == "RowBinary" {
 		sep = nil

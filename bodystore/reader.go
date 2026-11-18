@@ -45,7 +45,7 @@ func (r Reader) Read(ctx context.Context, id string, startedAt ...string) ([]byt
 		var row struct {
 			TS string `json:"started_at"`
 		}
-		err = json.NewDecoder(rc).Decode(&row)
+		err = DecodeRow(json.NewDecoder(rc), &row)
 		rc.Close()
 		if err != nil {
 			return nil, err
@@ -59,7 +59,7 @@ func (r Reader) Read(ctx context.Context, id string, startedAt ...string) ([]byt
 		if err != nil {
 			return nil, err
 		}
-		err = json.NewDecoder(rc).Decode(&row)
+		err = DecodeRow(json.NewDecoder(rc), &row)
 		rc.Close()
 		if err == nil {
 			break
@@ -102,7 +102,7 @@ func (r Reader) load(ctx context.Context, predicate string, params map[string]st
 			Hash    string `json:"hash_hex"`
 			Data    []byte `json:"data"`
 		}
-		if err := dec.Decode(&row); err == io.EOF {
+		if err := DecodeRow(dec, &row); err == io.EOF {
 			return blobs, nil
 		} else if err != nil {
 			return nil, err
@@ -158,4 +158,22 @@ func (row Body) Restore(blobs map[Key][]byte) ([]byte, error) {
 		items[h] = blobs[Key{row.Lineage, h}]
 	}
 	return Join(sk, items)
+}
+
+// DecodeRow rejects ClickHouse's HTTP 200 exception objects before decoding a data row.
+func DecodeRow(dec *json.Decoder, row any) error {
+	var raw json.RawMessage
+	if err := dec.Decode(&raw); err != nil {
+		return err
+	}
+	var envelope struct {
+		Exception json.RawMessage `json:"exception"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return err
+	}
+	if len(envelope.Exception) != 0 {
+		return fmt.Errorf("ClickHouse stream exception")
+	}
+	return json.Unmarshal(raw, row)
 }

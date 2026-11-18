@@ -13,8 +13,8 @@ import (
 )
 
 const (
-	pluginName    = "clickhouse-sink"
-	pluginVersion = "0.1.0-plana.3"
+	pluginName = "clickhouse-sink"
+
 	// schemaVersion 7 is the oldest host contract that omits request bodies
 	// on after-auth interception and on stream payload chunks; newer hosts
 	// accept older plugin schemas.
@@ -25,6 +25,8 @@ const (
 	defaultUser     = "default"
 	passwordEnv     = "CLICKHOUSE_PASSWORD"
 )
+
+var pluginVersion = "0.0.0-dev"
 
 type pluginConfig struct {
 	URL         string `yaml:"url"`

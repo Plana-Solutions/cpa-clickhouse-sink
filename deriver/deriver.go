@@ -293,7 +293,15 @@ SETTINGS max_threads=1, max_block_size=1, preferred_block_size_bytes=1048576`
 		extract.Row
 		bodystore.Body
 	}
-	return streamRows(ctx, d.ch, q, map[string]string{"ids": chArray(ids)}, func(r stored) error {
+	pending := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		pending[id] = true
+	}
+	err = streamRows(ctx, d.ch, q, map[string]string{"ids": chArray(ids)}, func(r stored) error {
+		if !pending[r.RequestID] {
+			return fmt.Errorf("unexpected or duplicate request id in body batch")
+		}
+		delete(pending, r.RequestID)
 		body, err := r.Body.Restore(blobs)
 		if err != nil {
 			d.log.Warn("body incomplete", "request_id", r.RequestID)
@@ -303,6 +311,13 @@ SETTINGS max_threads=1, max_block_size=1, preferred_block_size_bytes=1048576`
 		r.Row.RequestBody = string(body)
 		return fn(r.Row)
 	})
+	if err != nil {
+		return err
+	}
+	if len(pending) != 0 {
+		return fmt.Errorf("body batch missing %d requested ids", len(pending))
+	}
+	return nil
 }
 
 func (d *deriver) knownConversations(ctx context.Context, ids []string) (map[string]bool, error) {

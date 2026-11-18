@@ -105,7 +105,7 @@ func (d *deriver) migrate(ctx context.Context, dry bool) (migrationReport, error
 				return report, err
 			}
 			data := bodystore.EncodeBlob(lineage, h, data, ts)
-			rc, err := d.ch.do(ctx, `INSERT INTO `+d.db+`.body_blobs (lineage,hash,data,first_seen) FORMAT RowBinary`, nil, data)
+			rc, err := d.ch.do(ctx, `INSERT INTO `+d.db+`.body_blobs (lineage,hash,data,first_seen) SETTINGS insert_deduplicate=0 FORMAT RowBinary`, nil, data)
 			if err != nil {
 				return report, err
 			}

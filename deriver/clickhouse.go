@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/Plana-Solutions/cpa-clickhouse-sink/bodystore"
 )
 
 // clickhouse is a minimal ClickHouse HTTP interface client.
@@ -33,6 +35,7 @@ func (c *clickhouse) do(ctx context.Context, query string, params map[string]str
 	q := url.Values{}
 	q.Set("output_format_json_quote_64bit_integers", "0")
 	q.Set("max_threads", "1")
+	q.Set("http_write_exception_in_output_format", "0")
 	q.Set("max_execution_time", "30")
 	q.Set("max_memory_usage", fmt.Sprint(c.memoryBytes))
 	for k, v := range params {
@@ -98,7 +101,7 @@ func streamRows[T any](ctx context.Context, c *clickhouse, query string, params 
 	dec := json.NewDecoder(rc)
 	for {
 		var row T
-		if err := dec.Decode(&row); err == io.EOF {
+		if err := bodystore.DecodeRow(dec, &row); err == io.EOF {
 			return nil
 		} else if err != nil {
 			return fmt.Errorf("decode row: %w", err)
@@ -192,7 +195,7 @@ func (c *clickhouse) external(ctx context.Context, query string, params map[stri
 	if err = w.Close(); err != nil {
 		return err
 	}
-	q := url.Values{"query": {query}, "skeleton_format": {"RowBinary"}, "skeleton_structure": {structure}, "max_threads": {"1"}, "max_memory_usage": {fmt.Sprint(c.memoryBytes)}, "max_execution_time": {"30"}}
+	q := url.Values{"query": {query}, "insert_deduplicate": {"0"}, "http_write_exception_in_output_format": {"0"}, "skeleton_format": {"RowBinary"}, "skeleton_structure": {structure}, "max_threads": {"1"}, "max_memory_usage": {fmt.Sprint(c.memoryBytes)}, "max_execution_time": {"30"}}
 	for k, v := range params {
 		q.Set("param_"+k, v)
 	}

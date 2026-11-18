@@ -298,3 +298,38 @@ func TestHashCacheByteCap(t *testing.T) {
 		t.Fatal(charged)
 	}
 }
+
+func TestFlagOffDrainsQueuedBodies(t *testing.T) {
+	var inline []byte
+	blobs := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("query")
+		if strings.Contains(q, "body_blobs") {
+			blobs++
+			w.WriteHeader(503)
+			return
+		}
+		if strings.Contains(q, "INSERT INTO test.requests") {
+			if r.URL.Query().Get("insert_deduplicate") != "0" {
+				t.Error("body re-insert dedup enabled")
+			}
+			inline, _ = io.ReadAll(r.Body)
+		}
+	}))
+	defer server.Close()
+	cfg := sinkConfig{URL: server.URL, Database: "test", BodyDedup: true}
+	s := newSink(cfg)
+	s.schemaOK = true
+	body := `{"messages":["queued"]}`
+	s.addRequest(requestRow{RequestID: "queued", StartedAt: formatTime(time.Now()), RequestHeaders: map[string]string{"session-id": "s"}, RequestBody: body})
+	s.flushNow()
+	if s.bodyRetry == nil {
+		t.Fatal("body not queued")
+	}
+	cfg.BodyDedup = false
+	s.reconfigure(cfg)
+	s.flushNow()
+	if s.buffered != 0 || s.bodyRetry != nil || blobs != 1 || !strings.Contains(string(inline), body) {
+		t.Fatalf("flag-off drain failed buffered=%d blobs=%d", s.buffered, blobs)
+	}
+}

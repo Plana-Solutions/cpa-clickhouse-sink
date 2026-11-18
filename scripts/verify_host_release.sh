@@ -20,6 +20,7 @@ with zipfile.ZipFile(sys.argv[1]) as z:
     z.extractall(sys.argv[2])
 PY
 cp "$(dirname "$0")/fake_upstream.py" "$work/fake.py"
+cp "$(dirname "$0")/host_soak.py" "$work/host_soak.py"
 cat > "$work/cpa/config.yaml" <<YAML
 config-version: 8
 server:
@@ -156,6 +157,12 @@ PYHASH
   [[ "$inline" == $'0\t9' ]]
   echo "Dedup production-image byte-exact SQL reconstruction verified. rows=9"
 fi
+if [[ "${SOAK_SECONDS:-0}" -ge 1200 ]]; then
+  containers+=("$prefix-soak")
+  sudo -n docker run --name "$prefix-soak" --network "$prefix" -v "$work:/verify:ro" python:3.12-slim python /verify/host_soak.py "$prefix-cpa" "$prefix-ch" "$SOAK_SECONDS"
+fi
+rows=$(sudo -n docker exec "$prefix-ch" clickhouse-client --password isolated-release-clickhouse --query 'SELECT count() FROM cliproxy.requests')
+expected_facts=$((rows + 2))
 # Inject a new row referencing a removed blob, followed by a valid inline row.
 sudo -n docker exec "$prefix-ch" clickhouse-client --password isolated-release-clickhouse --multiquery --query "
 TRUNCATE TABLE cliproxy.body_blobs;
@@ -163,10 +170,10 @@ INSERT INTO cliproxy.requests SELECT * EXCEPT(duration_ms) REPLACE ('missing-blo
 INSERT INTO cliproxy.requests SELECT * EXCEPT(duration_ms) REPLACE ('after-missing-blob' AS request_id,now64(9) AS ingested_at,'{\"messages\":[{\"role\":\"user\",\"content\":\"valid\"}]}' AS request_body,0 AS body_len,repeat(char(0),32) AS body_sha256,'' AS body_residual,[] AS body_ref_offsets,[] AS body_refs) FROM cliproxy.requests LIMIT 1;"
 for attempt in $(seq 1 45); do
  facts=$(sudo -n docker exec "$prefix-ch" clickhouse-client --password isolated-release-clickhouse --query 'SELECT count() FROM cliproxy.request_facts')
- if [[ "$facts" == 11 ]]; then break; fi
+ if [[ "$facts" == "$expected_facts" ]]; then break; fi
  sleep 1
 done
-[[ "$facts" == 11 ]]
+[[ "$facts" == "$expected_facts" ]]
 status=$(sudo -n docker exec "$prefix-ch" clickhouse-client --password isolated-release-clickhouse --query "SELECT parse_status FROM cliproxy.request_facts WHERE request_id='missing-blob-test'")
 [[ "$status" == body_incomplete ]]
 status=$(sudo -n docker exec "$prefix-ch" clickhouse-client --password isolated-release-clickhouse --query "SELECT parse_status FROM cliproxy.request_facts WHERE request_id='after-missing-blob'")
@@ -174,4 +181,6 @@ status=$(sudo -n docker exec "$prefix-ch" clickhouse-client --password isolated-
 echo "Missing blob stored as body_incomplete. Later good row derived. facts=$facts"
 echo "Production-image load verified. requests=$rows usage=$usage request_facts=$facts"
 echo "Released deriver verified in stock distroless image with mounted password file."
+if sudo -n docker logs "$prefix-cpa" 2>&1 | grep -E 'buffer full, dropped|dropped [1-9]'; then exit 1; fi
+sudo -n docker inspect "$prefix-ch" --format 'ClickHouse cap={{.HostConfig.Memory}} OOMKilled={{.State.OOMKilled}}'
 sudo -n docker logs "$prefix-cpa" 2>&1 | grep -E 'clickhouse-sink|plugin.*load' | tail -10
