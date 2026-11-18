@@ -44,3 +44,9 @@ Rollout instructions and config are in [BODY_STORAGE.md](../BODY_STORAGE.md). De
 The initial native ARM64 workflow passed vet and race tests but failed its ABI assertion because the release verifier still expected the old plugin version. The assertion and registry now name v0.1.0-plana.3.
 
 Automated PR review found two retry gaps after the first publication. The final release pins each retry unit to its original destination, scopes the acknowledged-hash cache to the destination, and invalidates schema state after body-write failures. Regression tests fail a request insert, change the destination, and verify old retries stay on the old server while the new server receives its own blobs. The v0.1.0-plana.3 tag and assets were refreshed before handoff.
+
+## Published assets
+
+The final [v0.1.0-plana.3 release](https://github.com/Plana-Solutions/cpa-clickhouse-sink/releases/tag/v0.1.0-plana.3) is built from `d6090964b59a2aba77eca517915ea49f24918548`. The [native workflow](https://github.com/Plana-Solutions/cpa-clickhouse-sink/actions/runs/44370388414) passed. All five entries in the downloaded [SHA256SUMS](plana3-SHA256SUMS) verified. The downloaded ZIP and deriver then passed the exact-production-image test again; [actual output](plana3-host.log) is retained. The following evidence and verifier-volume cleanup commit changes no compiled code.
+
+The verifier now removes anonymous container volumes as well as containers and networks. The three volumes created by this task's earlier attempts were removed individually. Fetched live JSONL, local ClickHouse data, and disposable host build files were deleted. Existing host resources were preserved.

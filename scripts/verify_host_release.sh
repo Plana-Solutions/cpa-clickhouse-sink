@@ -7,7 +7,7 @@ work="$(mktemp -d "$HOME/plana-ch-release.XXXXXX")"
 containers=()
 network_created=false
 cleanup() {
-  for name in "${containers[@]}"; do sudo -n docker rm -f "$name" >/dev/null; done
+  for name in "${containers[@]}"; do sudo -n docker rm -fv "$name" >/dev/null; done
   if "$network_created"; then sudo -n docker network rm "$prefix" >/dev/null; fi
   rm -rf "$work"
 }
