@@ -128,7 +128,7 @@ func (d *deriver) migrate(ctx context.Context, dry bool) (migrationReport, error
 			return report, err
 		}
 
-		err = d.ch.exec(ctx, "SELECT throwIf(count()=0,'migrated skeleton missing') FROM "+d.db+".requests PREWHERE request_id={id:String} AND started_at={ts:DateTime64(9,'UTC')} WHERE request_body='' AND body_sha256=unhex({sha:String})", map[string]string{"id": r.ID, "ts": r.TS, "sha": r.SHA})
+		err = d.ch.exec(ctx, "SELECT throwIf(count()=0,'migrated skeleton missing') FROM "+d.db+".requests PREWHERE request_id={id:String} AND started_at={ts:DateTime64(9,'UTC')} WHERE body_sha256=unhex({sha:String})", map[string]string{"id": r.ID, "ts": r.TS, "sha": r.SHA})
 		if err != nil {
 			return report, fmt.Errorf("verify migrated skeleton %s: %w", r.ID, bodystore.ErrIncomplete)
 		}

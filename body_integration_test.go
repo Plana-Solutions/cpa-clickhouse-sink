@@ -285,10 +285,10 @@ func TestBodyIntegration(t *testing.T) {
 		t.Logf("%s %s", measurement.name, q("SELECT max(memory_usage) FROM system.query_log WHERE type='QueryFinish' AND query LIKE '%"+db+"%' AND query NOT LIKE '%system.query_log%' AND event_time_microseconds>=toDateTime64('"+measurement.since+"',6,'UTC')"))
 	}
 	q("TRUNCATE TABLE " + db + ".body_blobs")
-	if b, err := reader.Read(context.Background(), rows[0].RequestID); err == nil || b != nil {
+	if b, err := reader.Read(context.Background(), "backlog-00000"); err == nil || b != nil {
 		t.Fatal("missing blob accepted")
 	}
-	if got := string(q("SELECT body_status FROM " + db + ".raw_request(id='" + rows[0].RequestID + "')")); got != "incomplete" {
+	if got := string(q("SELECT body_status FROM " + db + ".raw_request(id='backlog-00000')")); got != "incomplete" {
 		t.Fatal("SQL missing blob", got)
 	}
 }

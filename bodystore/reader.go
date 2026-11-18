@@ -53,15 +53,20 @@ func (r Reader) Read(ctx context.Context, id string, startedAt ...string) ([]byt
 		params["ts"] = row.TS
 	}
 	predicate := `request_id={id:String} AND started_at={ts:DateTime64(9,'UTC')}`
-	rc, err := r.Query(ctx, "SELECT "+Projection+" FROM "+r.Database+`.requests PREWHERE `+predicate+` ORDER BY request_body = '' DESC LIMIT 1 FORMAT JSONEachRow`, params)
-	if err != nil {
-		return nil, err
-	}
 	var row Body
-	err = json.NewDecoder(rc).Decode(&row)
-	rc.Close()
-	if err != nil {
-		return nil, err
+	for _, filter := range []string{"body_sha256!=repeat(char(0),32)", "body_sha256=repeat(char(0),32)"} {
+		rc, err := r.Query(ctx, "SELECT "+Projection+" FROM "+r.Database+`.requests PREWHERE `+predicate+` AND `+filter+` LIMIT 1 SETTINGS max_threads=1 FORMAT JSONEachRow`, params)
+		if err != nil {
+			return nil, err
+		}
+		err = json.NewDecoder(rc).Decode(&row)
+		rc.Close()
+		if err == nil {
+			break
+		}
+		if err != io.EOF || filter == "body_sha256=repeat(char(0),32)" {
+			return nil, err
+		}
 	}
 	if len(row.Refs) == 0 {
 		return row.Restore(nil)
