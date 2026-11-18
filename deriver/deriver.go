@@ -227,9 +227,11 @@ ORDER BY ingested_at, request_id LIMIT {limit:UInt32} SETTINGS max_threads=1`
 		return nil, nil, err
 	}
 	pending := rows[:0]
+	selected := map[string]bool{}
 	ids = nil
 	for _, r := range rows {
-		if !known[r.RequestID] {
+		if !known[r.RequestID] && !selected[r.RequestID] {
+			selected[r.RequestID] = true
 			pending = append(pending, r)
 			ids = append(ids, r.RequestID)
 		}
@@ -257,12 +259,12 @@ func (d *deriver) fetch(ctx context.Context, ids []string, fn func(extract.Row) 
 	if err != nil {
 		return err
 	}
-	q := `SELECT request_id, trace_id, started_at, ingested_at,
+	q := `SELECT * FROM (SELECT request_id, trace_id, started_at, ingested_at,
  duration_ms, path, source_format, model, stream, outcome, status_code, error,
  request_headers, response_body, response_chunks, redaction_count, ` + bodystore.Projection + `
 FROM ` + d.db + `.requests PREWHERE request_id IN {ids:Array(String)}
-ORDER BY ingested_at, request_id, request_body = '' DESC
-LIMIT 1 BY request_id
+ORDER BY request_body = '' DESC LIMIT 1 BY request_id)
+ORDER BY ingested_at,request_id
 SETTINGS max_threads=1, max_block_size=1, preferred_block_size_bytes=1048576`
 	type stored struct {
 		extract.Row

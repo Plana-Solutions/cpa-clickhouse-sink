@@ -77,3 +77,28 @@ func BenchmarkSplit(b *testing.B) {
 		Split(body)
 	}
 }
+
+func TestReaderRejectsCorruptSkeleton(t *testing.T) {
+	sk, items := Split([]byte(`{"input":["same"]}`))
+	refs := make([]string, len(sk.Refs))
+	blobs := map[Key][]byte{}
+	for i, h := range sk.Refs {
+		refs[i] = hex.EncodeToString(h[:])
+		blobs[Key{42, h}] = items[h]
+	}
+	row := Body{Lineage: 42, Length: sk.Length, SHA: hex.EncodeToString(sk.SHA256[:]), Residual: sk.Residual, Offsets: sk.Offsets, Refs: refs}
+	if _, err := row.Restore(blobs); err != nil {
+		t.Fatal(err)
+	}
+	row.SHA = hex.EncodeToString(make([]byte, 32))
+	if _, err := row.Restore(blobs); err == nil {
+		t.Fatal("zeroed digest accepted")
+	}
+	row.SHA = hex.EncodeToString(sk.SHA256[:])
+	for k := range blobs {
+		blobs[k] = []byte("corrupt")
+	}
+	if _, err := row.Restore(blobs); err == nil {
+		t.Fatal("corrupt item accepted")
+	}
+}

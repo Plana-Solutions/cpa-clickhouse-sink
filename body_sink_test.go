@@ -1,9 +1,12 @@
 package main
 
 import (
+	"fmt"
+	"github.com/Plana-Solutions/cpa-clickhouse-sink/bodystore"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -73,5 +76,62 @@ func TestBodyDedupDefaultOff(t *testing.T) {
 	c, err = parseConfig([]byte("body-dedup: true"))
 	if err != nil || !c.BodyDedup {
 		t.Fatal(c, err)
+	}
+}
+
+func TestDedupRedactsBeforeHashing(t *testing.T) {
+	dir := t.TempDir()
+	secret := "dedup-test-secret-0123456789"
+	file := dir + "/secrets.txt"
+	writeFile(t, file, secret+"\n")
+	s := newSink(sinkConfig{BodyDedup: true})
+	p := &plugin{sink: s, capture: newCapture(), redact: mustRedactor(t, file)}
+	call(t, p, "request.intercept_before", map[string]any{"RequestID": "redaction", "Body": []byte(`{"messages":[{"role":"user","content":"` + secret + `"}]}`)})
+	call(t, p, "request.complete", completion{RequestID: "redaction", Model: "m", StartedAt: time.Now(), CompletedAt: time.Now()})
+	if len(s.bodyPending) != 1 {
+		t.Fatal("request missing")
+	}
+	r := s.bodyPending[0]
+	b, err := bodystore.Join(r.sk, r.blobs)
+	if err != nil || strings.Contains(string(b), secret) {
+		t.Fatal("body was not redacted")
+	}
+	for _, v := range r.blobs {
+		if strings.Contains(string(v), secret) {
+			t.Fatal("unredacted blob")
+		}
+	}
+}
+
+func TestPreloadAfterRestart(t *testing.T) {
+	h := bodystore.HashBytes([]byte(`"same"`))
+	inserts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Query().Get("query"), "body_blobs") {
+			t.Error("resent committed blob")
+		}
+		if r.URL.Query().Get("query") == "" {
+			fmt.Fprintf(w, "{\"hash\":\"%X\"}\n", h)
+			return
+		}
+		inserts++
+	}))
+	defer server.Close()
+	s := newSink(sinkConfig{URL: server.URL, Database: "test", BodyDedup: true})
+	s.schemaOK = true
+	s.addRequest(requestRow{RequestHeaders: map[string]string{"session-id": "restart"}, RequestBody: `{"messages":["same"]}`})
+	s.flushNow()
+	if inserts != 1 {
+		t.Fatal(inserts)
+	}
+}
+
+func TestSchemaCopiesMatch(t *testing.T) {
+	b, err := os.ReadFile("schema.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(string(b)), strings.TrimSpace(bodystore.Schema)) {
+		t.Fatal("raw and embedded body schemas differ")
 	}
 }

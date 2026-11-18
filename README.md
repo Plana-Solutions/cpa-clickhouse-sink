@@ -120,3 +120,5 @@ plugin ID, so don't rename it.
 go test -race ./...            # plugin and redact package
 cd deriver; and go test ./...  # deriver (see its README for integration tests)
 ```
+
+See [lossless body storage](BODY_STORAGE.md) for the opt-in `body-dedup` setting, reader deployment order, migration, retention, and acceptance checks.

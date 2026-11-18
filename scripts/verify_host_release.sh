@@ -46,6 +46,7 @@ plugins:
       username: "default"
       password: "isolated-release-clickhouse"
       store-bodies: true
+      body-dedup: ${BODY_DEDUP:-false}
       redact-files: ["/CLIProxyAPI/config.yaml"]
 YAML
 cat > "$work/client.py" <<'PY'
@@ -102,6 +103,25 @@ for attempt in $(seq 1 60); do
   sleep 1
 done
 [[ "$facts" == 3 ]]
+if [[ "${BODY_DEDUP:-false}" == true ]]; then
+  ids=$(sudo -n docker exec "$prefix-ch" clickhouse-client --password isolated-release-clickhouse --query 'SELECT request_id FROM cliproxy.requests')
+  expected=$(python3 - <<'PYHASH'
+import json,hashlib
+values=[]
+for stream in [False,True]:
+    body={'model':'fake-model','stream':stream,'messages':[{'role':'user','content':'release verification'}]}
+    values.append("'"+hashlib.sha256(json.dumps(body).encode()).hexdigest().upper()+"'")
+print(','.join(values))
+PYHASH
+)
+  for id in $ids; do
+    exact=$(sudo -n docker exec "$prefix-ch" clickhouse-client --password isolated-release-clickhouse --query "SELECT count() FROM cliproxy.raw_request(id='$id') WHERE body_status='complete' AND hex(SHA256(request_body)) IN ($expected)")
+    [[ "$exact" == 1 ]]
+  done
+  inline=$(sudo -n docker exec "$prefix-ch" clickhouse-client --password isolated-release-clickhouse --query "SELECT countIf(request_body!=''),countIf(body_len>0) FROM cliproxy.requests")
+  [[ "$inline" == $'0\t3' ]]
+  echo "Dedup production-image byte-exact SQL reconstruction verified. rows=3"
+fi
 echo "Production-image load verified. requests=$rows usage=$usage request_facts=$facts"
 echo "Released deriver verified in stock distroless image with mounted password file."
 sudo -n docker logs "$prefix-cpa" 2>&1 | grep -E 'clickhouse-sink|plugin.*load' | tail -10

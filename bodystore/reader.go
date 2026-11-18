@@ -55,7 +55,7 @@ func (r Reader) Load(ctx context.Context, ids []string) (map[Key][]byte, error) 
 	for i, id := range ids {
 		vals[i] = "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(id) + "'"
 	}
-	rc, err := r.Query(ctx, `SELECT lineage, hex(hash) AS hash, base64Encode(data) AS data FROM `+r.Database+`.body_blobs
+	rc, err := r.Query(ctx, `SELECT lineage, hex(hash) AS hash_hex, base64Encode(data) AS data FROM `+r.Database+`.body_blobs
  WHERE (lineage,hash) IN (SELECT lineage,arrayJoin(body_refs) FROM `+r.Database+`.requests PREWHERE request_id IN {ids:Array(String)}) LIMIT 1 BY lineage,hash SETTINGS max_threads=1 FORMAT JSONEachRow`, map[string]string{"ids": "[" + strings.Join(vals, ",") + "]"})
 	if err != nil {
 		return nil, err
@@ -66,7 +66,7 @@ func (r Reader) Load(ctx context.Context, ids []string) (map[Key][]byte, error) 
 	for {
 		var row struct {
 			Lineage uint64 `json:"lineage"`
-			Hash    string `json:"hash"`
+			Hash    string `json:"hash_hex"`
 			Data    []byte `json:"data"`
 		}
 		if err := dec.Decode(&row); err == io.EOF {
@@ -95,6 +95,9 @@ func (row Body) Restore(blobs map[Key][]byte) ([]byte, error) {
 	if err != nil || len(sha) != 32 {
 		return nil, ErrIncomplete
 	}
+	if [32]byte(sha) == [32]byte{} && (row.Length != 0 || len(row.Residual) != 0 || len(row.Offsets) != 0 || len(row.Refs) != 0) {
+		return nil, ErrIncomplete
+	}
 	sk := Skeleton{Length: row.Length, SHA256: [32]byte(sha), Residual: row.Residual, Offsets: row.Offsets}
 	// Legacy rows have the default zero digest, including legacy empty bodies.
 	if row.Inline != "" || sk.SHA256 == [32]byte{} {
@@ -104,7 +107,9 @@ func (row Body) Restore(blobs map[Key][]byte) ([]byte, error) {
 		}
 		if sk.SHA256 != [32]byte{} {
 			sk.Residual = b
-			sk.Length = uint32(len(b))
+			if uint64(len(b)) != uint64(row.Length) {
+				return nil, ErrIncomplete
+			}
 			sk.Offsets = nil
 			return Join(sk, nil)
 		}

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -42,9 +43,16 @@ func (c *clickhouse) do(ctx context.Context, query string, params map[string]str
 		q.Set("query", query)
 		body = data
 	}
+	return c.send(ctx, q, body, "")
+}
+
+func (c *clickhouse) send(ctx context.Context, q url.Values, body []byte, contentType string) (io.ReadCloser, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"?"+q.Encode(), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
+	}
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	if c.user != "" {
 		req.SetBasicAuth(c.user, c.password)
@@ -168,4 +176,31 @@ func chArray(vals []string) string {
 	}
 	b.WriteByte(']')
 	return b.String()
+}
+
+// external inserts a binary skeleton without putting body bytes in URI or form fields.
+func (c *clickhouse) external(ctx context.Context, query string, params map[string]string, structure string, data []byte) error {
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	part, err := w.CreateFormFile("skeleton", "skeleton.bin")
+	if err != nil {
+		return err
+	}
+	if _, err = part.Write(data); err != nil {
+		return err
+	}
+	if err = w.Close(); err != nil {
+		return err
+	}
+	q := url.Values{"query": {query}, "skeleton_format": {"RowBinary"}, "skeleton_structure": {structure}, "max_threads": {"1"}, "max_memory_usage": {fmt.Sprint(c.memoryBytes)}, "max_execution_time": {"30"}}
+	for k, v := range params {
+		q.Set("param_"+k, v)
+	}
+	rc, err := c.send(ctx, q, body.Bytes(), w.FormDataContentType())
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	_, err = io.Copy(io.Discard, rc)
+	return err
 }

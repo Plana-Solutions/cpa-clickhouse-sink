@@ -409,3 +409,37 @@ func TestDeriverQueriesCarryResourceLimits(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestMigrateNewSkeleton(t *testing.T) {
+	d := testDeriver(t)
+	ctx := context.Background()
+	r := fixtureRow(t, "chat_stream", "new-migration", time.Now().Add(-15*time.Minute))
+	// A large value outside protocol items exercises binary skeleton transport.
+	r.RequestBody = `{"extra":"` + strings.Repeat("a", 2<<20) + `","messages":[{"role":"user","content":"hello"}]}`
+	insertRaw(t, d, r)
+	if _, err := d.rebuild(ctx); err != nil {
+		t.Fatal(err)
+	}
+	dry, err := d.migrate(ctx, true)
+	if err != nil || dry.Rows != 1 {
+		t.Fatal(dry, err)
+	}
+	report, err := d.migrate(ctx, false)
+	if err != nil {
+		if e, ok := err.(*chError); ok {
+			t.Log(e.detail())
+		}
+		t.Fatal(report, err)
+	}
+	b, err := d.bodyReader().Read(ctx, r.RequestID)
+	if err != nil || string(b) != r.RequestBody {
+		t.Fatal("reconstruction", err)
+	}
+	if got := scalar(t, d, "SELECT count(),countIf(request_body!='') FROM "+testDB+".requests"); got != "1\t0" {
+		t.Fatal(got)
+	}
+	report, err = d.migrate(ctx, false)
+	if err != nil || report.Rows != 0 {
+		t.Fatal(report, err)
+	}
+}

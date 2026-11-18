@@ -160,3 +160,7 @@ Note: full bodies can contain secrets pasted into prompts or tool output; access
   tool results by `role = 'tool'`. Codex tool outputs have no error flag, so "failing tools" also matches error text.
 - ClickHouse logs at `warning` with `text_log` off, so query text (which can quote stored inference) is not written to
   server log files. `inference_reader` cannot read `system.*` tables.
+
+## Lossless request item storage
+
+The optional item storage format is specified in [BODY_STORAGE.md](BODY_STORAGE.md). `request_body` remains the legacy inline body. New rows carry `lineage`, `body_len`, `body_sha256`, `body_residual`, `body_ref_offsets`, and `body_refs`. `body_blobs` stores exact redacted items scoped by lineage. All body consumers must use the shared verified reader or `raw_request(id=...)`.
