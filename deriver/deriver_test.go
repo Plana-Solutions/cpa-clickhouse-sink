@@ -195,7 +195,11 @@ func TestPoisonRowDoesNotBlock(t *testing.T) {
 	garbage := fixtureRow(t, "chat_stream", "req-garbage", base.Add(2*time.Second))
 	garbage.RequestBody = "{not json"
 	garbage.ResponseChunks = []string{"\x00\xff", "data: {broken"}
-	insertRaw(t, d, good, poison, garbage)
+	missing := fixtureRow(t, "chat_stream", "req-incomplete", base.Add(3*time.Second))
+	insertRaw(t, d, good, poison, garbage, missing)
+	if err := d.ch.exec(context.Background(), "ALTER TABLE "+testDB+".requests UPDATE request_body='', body_len=1, body_sha256=SHA256('x'), body_refs=[substring(SHA256('x'),1,16)], body_ref_offsets=[0] WHERE request_id='req-incomplete' SETTINGS mutations_sync=1", nil); err != nil {
+		t.Fatal(err)
+	}
 
 	d.extract = func(r extract.Row, prior bool) extract.Facts {
 		if r.RequestID == "req-poison" {
@@ -204,17 +208,25 @@ func TestPoisonRowDoesNotBlock(t *testing.T) {
 		return extract.Extract(r, prior)
 	}
 	n, err := d.pass(context.Background())
-	if err != nil || n != 3 {
-		t.Fatalf("pass = %d, %v; want 3", n, err)
+	if err != nil || n != 4 {
+		t.Fatalf("pass = %d, %v; want 4", n, err)
 	}
 	got := scalar(t, d, "SELECT request_id, parse_status FROM "+testDB+".request_facts ORDER BY request_id FORMAT TSV")
-	want := "req-garbage\tunparseable\nreq-good\tok\nreq-poison\tunparseable"
+	want := "req-garbage\tunparseable\nreq-good\tok\nreq-incomplete\tbody_incomplete\nreq-poison\tunparseable"
 	if got != want {
 		t.Fatalf("statuses:\n%s\nwant:\n%s", got, want)
 	}
 	if n, err := d.pass(context.Background()); err != nil || n != 0 {
 		t.Fatalf("second pass = %d, %v; poison row must not be retried", n, err)
 	}
+	before := scalar(t, d, "SELECT count() FROM "+testDB+".request_facts")
+	if _, err := d.rebuild(context.Background()); err == nil {
+		t.Fatal("rebuild accepted missing blob")
+	}
+	if got := scalar(t, d, "SELECT count() FROM "+testDB+".request_facts"); got != before {
+		t.Fatal("rebuild truncated facts")
+	}
+
 }
 
 func TestRebuildIsIdempotent(t *testing.T) {
@@ -416,12 +428,14 @@ func TestMigrateNewSkeleton(t *testing.T) {
 	r := fixtureRow(t, "chat_stream", "new-migration", time.Now().Add(-15*time.Minute))
 	// A large value outside protocol items exercises binary skeleton transport.
 	r.RequestBody = `{"extra":"` + strings.Repeat("a", 2<<20) + `","messages":[{"role":"user","content":"hello"}]}`
-	insertRaw(t, d, r)
+	other := r
+	other.RequestID = "second-migration"
+	insertRaw(t, d, r, other)
 	if _, err := d.rebuild(ctx); err != nil {
 		t.Fatal(err)
 	}
 	dry, err := d.migrate(ctx, true)
-	if err != nil || dry.Rows != 1 {
+	if err != nil || dry.Rows != 2 {
 		t.Fatal(dry, err)
 	}
 	report, err := d.migrate(ctx, false)
@@ -431,15 +445,34 @@ func TestMigrateNewSkeleton(t *testing.T) {
 		}
 		t.Fatal(report, err)
 	}
+	if dry.ProjectedBytes != report.ProjectedBytes {
+		t.Fatal("dry run missed cross-row dedup", dry, report)
+	}
 	b, err := d.bodyReader().Read(ctx, r.RequestID)
 	if err != nil || string(b) != r.RequestBody {
 		t.Fatal("reconstruction", err)
 	}
-	if got := scalar(t, d, "SELECT count(),countIf(request_body!='') FROM "+testDB+".requests"); got != "1\t0" {
+	if got := scalar(t, d, "SELECT count(),countIf(request_body!='') FROM "+testDB+".requests"); got != "2\t0" {
 		t.Fatal(got)
 	}
 	report, err = d.migrate(ctx, false)
 	if err != nil || report.Rows != 0 {
 		t.Fatal(report, err)
+	}
+}
+
+func TestRestoreKeepsSkeletonOnIncompleteBody(t *testing.T) {
+	d := testDeriver(t)
+	ctx := context.Background()
+	r := fixtureRow(t, "chat_stream", "restore-missing", time.Now().Add(-time.Hour))
+	insertRaw(t, d, r)
+	if err := d.ch.exec(ctx, "ALTER TABLE "+testDB+".requests UPDATE request_body='',body_len=1,body_sha256=SHA256('x'),body_refs=[substring(SHA256('x'),1,16)],body_ref_offsets=[0] WHERE 1 SETTINGS mutations_sync=1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.restoreBodies(ctx, false); err == nil {
+		t.Fatal("accepted missing blob")
+	}
+	if got := scalar(t, d, "SELECT countIf(body_len=1),countIf(request_body!='') FROM "+testDB+".requests"); got != "1\t0" {
+		t.Fatal("incomplete row changed", got)
 	}
 }

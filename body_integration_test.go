@@ -222,6 +222,18 @@ func TestBodyIntegration(t *testing.T) {
 			t.Fatal("migrated body", r.RequestID, err)
 		}
 	}
+	t.Logf("restore dry-run %s", run("restore-bodies", "--dry-run"))
+	t.Logf("restore %s", run("restore-bodies"))
+	t.Logf("restore rerun %s", run("restore-bodies"))
+	if got := string(q("SELECT countIf(body_sha256!=repeat(char(0),32)),count() FROM " + db + ".requests")); got != fmt.Sprintf("0\t%d", len(rows)) {
+		t.Fatal("restore rows", got)
+	}
+	for _, r := range rows {
+		b, err := reader.Read(context.Background(), r.RequestID, r.StartedAt)
+		if err != nil || !bytes.Equal(b, []byte(r.RequestBody)) {
+			t.Fatal("restored body", r.RequestID, err)
+		}
+	}
 	// Restore corruption checks after the backlog run so every prior comparison uses valid data.
 	const backlog = 3200
 	for i := 0; i < backlog; i++ {

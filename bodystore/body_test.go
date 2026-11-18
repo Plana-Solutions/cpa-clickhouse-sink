@@ -102,3 +102,12 @@ func TestReaderRejectsCorruptSkeleton(t *testing.T) {
 		t.Fatal("corrupt item accepted")
 	}
 }
+
+func TestLineageNonStringUserIDFallsBack(t *testing.T) {
+	if Lineage(nil, []byte(`{"metadata":{"user_id":42},"prompt_cache_key":"fallback","messages":["large"]}`)) != LineageKey("fallback") {
+		t.Fatal("lost fallback")
+	}
+	if Lineage(nil, []byte(`{"metadata":{"user_id":"escaped\\key"}}`)) != LineageKey(`escaped\key`) {
+		t.Fatal("string escape")
+	}
+}

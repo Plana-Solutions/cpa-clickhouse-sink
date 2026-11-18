@@ -22,8 +22,9 @@ import (
 )
 
 func main() {
+	restore := len(os.Args) > 1 && os.Args[1] == "restore-bodies"
 	migrate := len(os.Args) > 1 && os.Args[1] == "migrate-bodies"
-	if migrate {
+	if migrate || restore {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 	}
 	dryRun := flag.Bool("dry-run", false, "report migration size without writing rows")
@@ -61,14 +62,20 @@ func main() {
 
 	d.batchSize, d.batchBytes, d.maxRows = *batchRows, *batchBytes, *maxRows
 
-	if !(migrate && *dryRun) {
+	if !((migrate || restore) && *dryRun) {
 		if err := waitSetup(ctx, d, *interval); err != nil {
 			log.Error("setup aborted", "err", err)
 			os.Exit(1)
 		}
 	}
-	if migrate {
-		report, err := d.migrate(ctx, *dryRun)
+	if migrate || restore {
+		var report migrationReport
+		var err error
+		if restore {
+			report, err = d.restoreBodies(ctx, *dryRun)
+		} else {
+			report, err = d.migrate(ctx, *dryRun)
+		}
 		if err != nil {
 			log.Error("migration failed", "err", err)
 			os.Exit(1)

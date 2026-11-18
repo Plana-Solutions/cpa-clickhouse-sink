@@ -111,13 +111,10 @@ func newSink(cfg sinkConfig) *sink {
 }
 
 func (s *sink) reconfigure(cfg sinkConfig) {
-	s.flushMu.Lock()
-	defer s.flushMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if !s.cfg.equal(cfg) {
 		s.cfg = cfg
-		s.known = nil
 		s.schemaOK = false
 	}
 }
@@ -219,14 +216,6 @@ func (s *sink) flushNow() {
 		}
 		s.mu.Unlock()
 	}
-	if err := s.flushBodies(cfg); err != nil {
-		s.mu.Lock()
-		s.schemaOK = false
-		s.mu.Unlock()
-		s.keep(batches)
-		s.report(err)
-		return
-	}
 	for i, b := range batches {
 		if errInsert := s.insertBatch(cfg, b); errInsert != nil {
 			// Keep this batch and every later one; ClickHouse is likely down.
@@ -239,7 +228,13 @@ func (s *sink) flushNow() {
 		}
 		s.release(b.size)
 	}
-	s.report(nil)
+	bodyErr := s.flushBodies(cfg)
+	if bodyErr != nil {
+		s.mu.Lock()
+		s.schemaOK = false
+		s.mu.Unlock()
+	}
+	s.report(bodyErr)
 }
 
 // insertBatch inserts b. When ClickHouse rejects the data itself (HTTP 400)

@@ -47,6 +47,15 @@ func (d *deriver) setup(ctx context.Context) error {
 
 // rebuild truncates request_facts and derives everything again.
 func (d *deriver) rebuild(ctx context.Context) (int, error) {
+	// Validate before destructive writes. Writers and blob GC must be stopped for rebuild.
+	err := streamRows(ctx, d.ch, "SELECT DISTINCT request_id,started_at FROM "+d.db+".requests WHERE body_sha256!=repeat(char(0),32) SETTINGS max_threads=1", nil, func(r struct {
+		ID string `json:"request_id"`
+		TS string `json:"started_at"`
+	}) error { _, err := d.bodyReader().Read(ctx, r.ID, r.TS); return err })
+	if err != nil {
+		return 0, fmt.Errorf("rebuild refused before truncate: %w", err)
+	}
+
 	if err := d.ch.exec(ctx, "TRUNCATE TABLE "+d.db+".request_facts", nil); err != nil {
 		return 0, fmt.Errorf("truncate: %w", err)
 	}
@@ -107,6 +116,13 @@ func (d *deriver) runWindow(ctx context.Context, lower, upper string, limit int,
 			var facts []any
 			seen := map[string]bool{}
 			err := d.fetch(ctx, ids, func(r extract.Row) error {
+				if r.BodyIncomplete {
+					f := extract.Unparseable(r, "body incomplete")
+					f.ParseStatus = "body_incomplete"
+					redactFacts(d.redactor, &f)
+					facts = append(facts, toFactsRow(f))
+					return nil
+				}
 				conv := extract.Conversation(r)
 				prior := seen[conv]
 				if !prior && conv != "" {
@@ -273,7 +289,9 @@ SETTINGS max_threads=1, max_block_size=1, preferred_block_size_bytes=1048576`
 	return streamRows(ctx, d.ch, q, map[string]string{"ids": chArray(ids)}, func(r stored) error {
 		body, err := r.Body.Restore(blobs)
 		if err != nil {
-			return fmt.Errorf("request %s: %w", r.RequestID, err)
+			d.log.Warn("body incomplete", "request_id", r.RequestID)
+			r.Row.BodyIncomplete = true
+			return fn(r.Row)
 		}
 		r.Row.RequestBody = string(body)
 		return fn(r.Row)

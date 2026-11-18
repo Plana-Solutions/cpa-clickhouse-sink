@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/binary"
 	"fmt"
 	"github.com/Plana-Solutions/cpa-clickhouse-sink/bodystore"
 	"io"
@@ -8,6 +10,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -136,7 +140,7 @@ func TestSchemaCopiesMatch(t *testing.T) {
 	}
 }
 
-func TestBodyRetryKeepsDestination(t *testing.T) {
+func TestBodyRetryRepreparesDestination(t *testing.T) {
 	var a, b []string
 	failed := false
 	server := func(calls *[]string, fail bool) *httptest.Server {
@@ -173,10 +177,124 @@ func TestBodyRetryKeepsDestination(t *testing.T) {
 	s.reconfigure(cfg)
 	s.addRequest(row)
 	s.flushNow()
-	if strings.Join(a, ",") != "blobs,requests,requests" || strings.Join(b, ",") != "blobs,requests" {
+	if strings.Join(a, ",") != "blobs,requests" || strings.Join(b, ",") != "blobs,requests,requests" {
 		t.Fatal(a, b)
 	}
 	if s.buffered != 0 {
 		t.Fatal("buffer not released")
+	}
+}
+
+func TestBodyFailureDoesNotBlockOtherTables(t *testing.T) {
+	var calls []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query().Get("query")
+		if q == "" {
+			return
+		}
+		if strings.Contains(q, "body_blobs") {
+			calls = append(calls, "blobs")
+			w.WriteHeader(503)
+			return
+		}
+		if strings.Contains(q, "usage") {
+			calls = append(calls, "usage")
+		} else {
+			calls = append(calls, "legacy")
+		}
+	}))
+	defer server.Close()
+	s := newSink(sinkConfig{URL: server.URL, Database: "test", BodyDedup: true})
+	s.schemaOK = true
+	s.add(tableUsage, map[string]string{"request_id": "u"})
+	s.add(tableRequests, map[string]string{"request_id": "legacy"})
+	s.addRequest(requestRow{RequestBody: `{"messages":["new"]}`})
+	s.flushNow()
+	if len(calls) != 3 || calls[2] != "blobs" || len(s.retry) != 0 || s.bodyRetry == nil {
+		t.Fatal(calls)
+	}
+}
+
+func TestReconfigureNeverWaitsForFlush(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprint(enabled), func(t *testing.T) {
+			entered, release := make(chan struct{}), make(chan struct{})
+			var enteredOnce sync.Once
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { enteredOnce.Do(func() { close(entered) }); <-release }))
+			defer server.Close()
+			s := newSink(sinkConfig{URL: server.URL, Database: "test", BodyDedup: enabled})
+			s.schemaOK = true
+			s.add(tableUsage, map[string]string{"request_id": "r"})
+			done := make(chan struct{})
+			go func() { s.flushNow(); close(done) }()
+			<-entered
+			defer func() { close(release); <-done }()
+			configured := make(chan struct{})
+			go func() {
+				s.reconfigure(sinkConfig{URL: server.URL, Database: "other", BodyDedup: enabled})
+				s.addRequest(requestRow{RequestBody: `{}`})
+				s.add(tableUsage, map[string]string{"request_id": "next"})
+				close(configured)
+			}()
+			select {
+			case <-configured:
+			case <-time.After(200 * time.Millisecond):
+				t.Fatal("hooks waited for flush")
+			}
+		})
+	}
+}
+
+func TestPreloadDeadlineBudgetAndFailureNotCached(t *testing.T) {
+	var calls atomic.Int32
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		io.Copy(io.Discard, r.Body)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	defer server.Close()
+	defer close(release)
+	cfg := sinkConfig{URL: server.URL, Database: "test"}
+	s := newSink(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	started := time.Now()
+	for i := 0; i < 20; i++ {
+		s.lineage(ctx, cfg, uint64(i+1))
+	}
+	if took := time.Since(started); took > 3500*time.Millisecond {
+		t.Fatal("preload exceeded flush budget", took)
+	}
+	if len(s.known) != 0 {
+		t.Fatal("failed preloads cached")
+	}
+	if calls.Load() != 2 {
+		t.Fatal("unexpected preload calls", calls.Load())
+	}
+}
+
+func TestHashCacheByteCap(t *testing.T) {
+	s := newSink(sinkConfig{})
+	s.known = map[uint64]*knownLineage{}
+	for l := uint64(0); l < 4; l++ {
+		e := &knownLineage{hashes: map[bodystore.Hash]bool{}, used: time.Now()}
+		for i := 0; i < 100000; i++ {
+			var h bodystore.Hash
+			binary.LittleEndian.PutUint64(h[:], uint64(i))
+			e.hashes[h] = true
+		}
+		s.known[l] = e
+		s.trimKnown()
+	}
+	charged := 0
+	for _, e := range s.known {
+		charged += 256 + 64*len(e.hashes)
+	}
+	if charged > maxKnownBytes {
+		t.Fatal(charged)
 	}
 }

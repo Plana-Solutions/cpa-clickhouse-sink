@@ -32,17 +32,41 @@ type Body struct {
 const Projection = `base64Encode(request_body) AS body_inline, lineage, body_len, hex(body_sha256) AS body_sha,
  base64Encode(body_residual) AS body_residual_b64, body_ref_offsets, arrayMap(x -> hex(x), body_refs) AS body_hashes`
 
-func (r Reader) Read(ctx context.Context, id string) ([]byte, error) {
-	rc, err := r.Query(ctx, "SELECT "+Projection+" FROM "+r.Database+`.requests WHERE request_id = {id:String} ORDER BY request_body = '' DESC LIMIT 1 FORMAT JSONEachRow`, map[string]string{"id": id})
+// Read uses the primary-key time when supplied. Otherwise it resolves that metadata first.
+func (r Reader) Read(ctx context.Context, id string, startedAt ...string) ([]byte, error) {
+	params := map[string]string{"id": id}
+	if len(startedAt) > 0 {
+		params["ts"] = startedAt[0]
+	} else {
+		rc, err := r.Query(ctx, "SELECT started_at FROM "+r.Database+`.requests WHERE request_id={id:String} LIMIT 1 FORMAT JSONEachRow`, params)
+		if err != nil {
+			return nil, err
+		}
+		var row struct {
+			TS string `json:"started_at"`
+		}
+		err = json.NewDecoder(rc).Decode(&row)
+		rc.Close()
+		if err != nil {
+			return nil, err
+		}
+		params["ts"] = row.TS
+	}
+	predicate := `request_id={id:String} AND started_at={ts:DateTime64(9,'UTC')}`
+	rc, err := r.Query(ctx, "SELECT "+Projection+" FROM "+r.Database+`.requests PREWHERE `+predicate+` ORDER BY request_body = '' DESC LIMIT 1 FORMAT JSONEachRow`, params)
 	if err != nil {
 		return nil, err
 	}
-	defer rc.Close()
 	var row Body
-	if err := json.NewDecoder(rc).Decode(&row); err != nil {
+	err = json.NewDecoder(rc).Decode(&row)
+	rc.Close()
+	if err != nil {
 		return nil, err
 	}
-	blobs, err := r.Load(ctx, []string{id})
+	if len(row.Refs) == 0 {
+		return row.Restore(nil)
+	}
+	blobs, err := r.load(ctx, predicate, params)
 	if err != nil {
 		return nil, err
 	}
@@ -55,8 +79,12 @@ func (r Reader) Load(ctx context.Context, ids []string) (map[Key][]byte, error) 
 	for i, id := range ids {
 		vals[i] = "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(id) + "'"
 	}
+	return r.load(ctx, `request_id IN {ids:Array(String)}`, map[string]string{"ids": "[" + strings.Join(vals, ",") + "]"})
+}
+
+func (r Reader) load(ctx context.Context, predicate string, params map[string]string) (map[Key][]byte, error) {
 	rc, err := r.Query(ctx, `SELECT lineage, hex(hash) AS hash_hex, base64Encode(data) AS data FROM `+r.Database+`.body_blobs
- WHERE (lineage,hash) IN (SELECT lineage,arrayJoin(body_refs) FROM `+r.Database+`.requests PREWHERE request_id IN {ids:Array(String)}) LIMIT 1 BY lineage,hash SETTINGS max_threads=1 FORMAT JSONEachRow`, map[string]string{"ids": "[" + strings.Join(vals, ",") + "]"})
+ WHERE (lineage,hash) IN (SELECT lineage,arrayJoin(body_refs) FROM `+r.Database+`.requests PREWHERE `+predicate+`) LIMIT 1 BY lineage,hash SETTINGS max_threads=1 FORMAT JSONEachRow`, params)
 	if err != nil {
 		return nil, err
 	}

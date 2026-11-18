@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -68,7 +69,7 @@ func (s *sink) addRequest(row requestRow) {
 }
 
 // Only the flush goroutine owns the acknowledged-hash cache.
-func (s *sink) lineage(cfg sinkConfig, l uint64) *knownLineage {
+func (s *sink) lineage(ctx context.Context, cfg sinkConfig, l uint64) *knownLineage {
 	now := time.Now()
 	if !s.cacheCfg.equal(cfg) {
 		s.known = nil
@@ -98,15 +99,18 @@ func (s *sink) lineage(cfg sinkConfig, l uint64) *knownLineage {
 		delete(s.known, oldest)
 	}
 	e := &knownLineage{hashes: map[bodystore.Hash]bool{}, used: now}
-	s.known[l] = e
-	if l == 0 {
+	if l == 0 || ctx.Err() != nil {
 		return e
 	}
-	req, err := http.NewRequest(http.MethodPost, cfg.URL+"/", strings.NewReader(fmt.Sprintf("SELECT hex(hash) AS hash FROM %s.body_blobs WHERE lineage = %d LIMIT 100000 FORMAT JSONEachRow", cfg.Database, l)))
+	ctx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cfg.URL+"/", strings.NewReader(fmt.Sprintf("SELECT hex(hash) AS hash FROM %s.body_blobs WHERE lineage = %d LIMIT 100000 FORMAT JSONEachRow", cfg.Database, l)))
 	if err != nil {
 		return e
 	}
-	req.SetBasicAuth(cfg.Username, cfg.Password)
+	if cfg.Username != "" {
+		req.SetBasicAuth(cfg.Username, cfg.Password)
+	}
 	resp, err := s.client.Do(req)
 	if err != nil {
 		logf("body preload failed")
@@ -126,6 +130,8 @@ func (s *sink) lineage(cfg sinkConfig, l uint64) *knownLineage {
 		err := dec.Decode(&row)
 		if err == io.EOF {
 			e.hashes = hashes
+			s.known[l] = e
+			s.trimKnown()
 			break
 		}
 		if err != nil {
@@ -134,6 +140,7 @@ func (s *sink) lineage(cfg sinkConfig, l uint64) *knownLineage {
 		}
 		b, err := hex.DecodeString(row.Hash)
 		if err != nil || len(b) != 16 {
+			logf("body preload failed")
 			break
 		}
 		hashes[bodystore.Hash(b)] = true
@@ -148,11 +155,11 @@ func binaryBatch(table, columns string, rows [][]byte) *batch {
 	return &b
 }
 
-func (s *sink) prepareBodies(cfg sinkConfig, u *bodyUnit) {
+func (s *sink) prepareBodies(ctx context.Context, cfg sinkConfig, u *bodyUnit) {
 	rows := [][]byte{}
 	seen := map[bodystore.Key]bool{}
 	for _, r := range u.requests {
-		e := s.lineage(cfg, r.lineage)
+		e := s.lineage(ctx, cfg, r.lineage)
 		hs := make([]bodystore.Hash, 0, len(r.blobs))
 		for h := range r.blobs {
 			hs = append(hs, h)
@@ -179,12 +186,26 @@ func (s *sink) insertBlobs(cfg sinkConfig, b batch, keys []bodystore.Key, bad ma
 	}
 	err := s.insert(cfg, b)
 	if err == nil {
+		budget := maxKnownBytes
+		for _, e := range s.known {
+			budget -= 256 + 64*len(e.hashes)
+		}
 		for _, k := range keys {
-			e := s.lineage(cfg, k.Lineage)
-			if len(e.hashes) < 100000 {
+			e := s.known[k.Lineage]
+			if e == nil {
+				if budget < 320 || len(s.known) >= 512 {
+					continue
+				}
+				budget -= 256
+				e = &knownLineage{hashes: map[bodystore.Hash]bool{}, used: time.Now()}
+				s.known[k.Lineage] = e
+			}
+			if !e.hashes[k.Hash] && len(e.hashes) < 100000 && budget >= 64 {
+				budget -= 64
 				e.hashes[k.Hash] = true
 			}
 		}
+		s.trimKnown()
 		s.blobsWritten += len(keys)
 		return nil
 	}
@@ -206,6 +227,8 @@ func (s *sink) insertBlobs(cfg sinkConfig, b batch, keys []bodystore.Key, bad ma
 }
 
 func (s *sink) flushBodies(cfg sinkConfig) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
 	for {
 		s.mu.Lock()
 		u := s.bodyRetry
@@ -219,6 +242,11 @@ func (s *sink) flushBodies(cfg sinkConfig) error {
 		if u == nil {
 			return nil
 		}
+		if !u.cfg.equal(cfg) {
+			u.cfg = cfg
+			u.schemaOK = false
+			u.rows, u.blobs, u.keys = nil, nil, nil
+		}
 		if !u.schemaOK {
 			if err := s.ensureSchema(u.cfg); err != nil {
 				return err
@@ -227,7 +255,7 @@ func (s *sink) flushBodies(cfg sinkConfig) error {
 		}
 		if u.rows == nil {
 			if u.blobs == nil {
-				s.prepareBodies(u.cfg, u)
+				s.prepareBodies(ctx, u.cfg, u)
 			}
 			bad := map[bodystore.Key]bool{}
 			if err := s.insertBlobs(u.cfg, *u.blobs, u.keys, bad); err != nil {
@@ -251,7 +279,6 @@ func (s *sink) flushBodies(cfg sinkConfig) error {
 			}
 			u.rows = binaryBatch("requests", bodyRequestColumns, rows)
 			u.blobs = nil
-			u.requests = nil
 			u.keys = nil
 		}
 		if err := s.insertBatch(u.cfg, *u.rows); err != nil {
@@ -263,5 +290,26 @@ func (s *sink) flushBodies(cfg sinkConfig) error {
 		s.bodyRetry = nil
 		s.mu.Unlock()
 		logf("body blobs written=%d skipped=%d", s.blobsWritten, s.blobsSkipped)
+	}
+}
+
+// Charge 64 bytes per hash, including map slack, and 256 bytes per lineage.
+const maxKnownBytes = 16 << 20
+
+func (s *sink) trimKnown() {
+	size := 0
+	for _, e := range s.known {
+		size += 256 + 64*len(e.hashes)
+	}
+	for size > maxKnownBytes || len(s.known) > 512 {
+		var oldest uint64
+		var ts time.Time
+		for k, e := range s.known {
+			if ts.IsZero() || e.used.Before(ts) {
+				oldest, ts = k, e.used
+			}
+		}
+		size -= 256 + 64*len(s.known[oldest].hashes)
+		delete(s.known, oldest)
 	}
 }

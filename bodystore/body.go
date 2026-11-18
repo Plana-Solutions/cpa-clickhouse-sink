@@ -4,8 +4,8 @@ package bodystore
 import (
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
+	"github.com/tidwall/gjson"
 	"strings"
 )
 
@@ -90,20 +90,15 @@ func Lineage(headers map[string]string, body []byte) uint64 {
 			}
 		}
 	}
-	var fields struct {
-		Metadata struct {
-			UserID string `json:"user_id"`
-		} `json:"metadata"`
-		PromptCacheKey string `json:"prompt_cache_key"`
+	key := gjson.GetBytes(body, "metadata.user_id")
+	if key.Type == gjson.String && key.Str != "" {
+		return LineageKey(key.Str)
 	}
-	if json.Unmarshal(body, &fields) == nil {
-		if fields.Metadata.UserID != "" {
-			return LineageKey(fields.Metadata.UserID)
-		}
-		if fields.PromptCacheKey != "" {
-			return LineageKey(fields.PromptCacheKey)
-		}
+	key = gjson.GetBytes(body, "prompt_cache_key")
+	if key.Type == gjson.String && key.Str != "" {
+		return LineageKey(key.Str)
 	}
+
 	return 0
 }
 
