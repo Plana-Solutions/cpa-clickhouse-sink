@@ -55,14 +55,26 @@ TraceID is a UUIDv7 per HTTP connection, shared by all websocket turns on that c
   parallel arrays (direction, position, role, type, tool_name, call_id, arguments, is_error, text, text_hash).
   `messages` is a view: `request_facts ARRAY JOIN ...`. A facts row exists iff its messages exist, so the
   anti-join "raw request_id not in request_facts" is exact; a committed-but-unacked insert is simply skipped next pass.
-- Loop: every ~30 s, process raw rows with `ingested_at >= max(request_facts.ingested_at) - 1h` (whole table when empty)
-  that are not yet in request_facts, in (ingested_at, request_id) order. No fixed cutoff, so downtime backlog is processed.
-  `request_facts.ingested_at` is COPIED from the raw row (no DEFAULT), so the watermark only advances over rows actually
-  processed and an interrupted bulk pass or rebuild resumes safely. A failed facts insert is never retried within a pass;
-  the next pass's anti-join decides. Within a pass, conversation_ids already emitted are kept in memory so `priorSeen`
-  is correct for rows in the same batch.
-  Rebuild is a one-off command against the same service (`docker compose run --rm deriver --rebuild`, after stopping the
-  loop service): truncate, process all, exit. Never part of the service's default command.
+- Loop: every ~30 s, process at most 512 raw rows. Reserve half for the newest
+  five minutes, then process a bounded oldest backlog slice. Each lane orders by
+  (ingested_at, request_id). Candidate selection sorts only IDs and timestamps in one-hour windows;
+  payload sizes choose batches bounded by 16 rows and 8 MiB by default. Body
+  reads use PREWHERE IDs, one thread and one-row blocks; extraction streams rows,
+  and facts are inserted once per batch. A single oversized row runs alone.
+- request_facts.ingested_at is COPIED from the raw row. A separate deriver_progress
+  table stores copied raw ingestion times after acknowledged backlog inserts.
+  Backlog watermark is max(deriver_progress.ingested_at) - 1h, or epoch when empty.
+  Fresh facts never advance it, so live priority cannot strand unfinished rows.
+  The exact facts anti-join contains only the current candidate page IDs.
+  Every query uses one thread, a 256 MiB memory cap and a 30-second execution
+  limit. Normal passes have a two-minute deadline.
+  Failed inserts stop the pass without retry. A committed-but-unacknowledged
+  insert is skipped next pass. Conversation IDs already emitted in a batch are
+  remembered; previous batches are looked up in facts. With live priority,
+  priorSeen means previously processed, including newer live turns of imported
+  conversations. This intentionally changes cross-window processing order.
+  Rebuild stops the loop service, truncates facts and progress, processes oldest
+  first across bounded passes until empty, and exits. Never in the default command.
 - Which input items are emitted (tail rule):
   * First request seen for a conversation_id: emit the whole input (covers resumed/imported conversations).
   * Otherwise emit input items after the boundary = the last item that is model-produced (assistant message, reasoning,

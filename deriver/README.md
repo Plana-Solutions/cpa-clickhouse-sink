@@ -10,6 +10,7 @@ On startup (idempotent: `CREATE TABLE IF NOT EXISTS`, `CREATE OR REPLACE VIEW`):
 
 | Object | What it is |
 |---|---|
+| `deriver_progress` | Durable backlog checkpoint, independent of live facts. |
 | `request_facts` | One row per raw request: identity (`conversation_id`, `parent_conversation_id`, `client`, `kind`, Codex `request_kind`/`turn_id`), `reply_text`, `reasoning_text`, `tools_offered`/`tools_called`, `stop_reason`, `parse_status`, and the emitted messages as parallel `msg_*` arrays. `ORDER BY (started_at, request_id)`. |
 | `messages` (view) | `request_facts ARRAY JOIN msg_*`: one row per emitted message (`direction`, `position`, `role`, `type`, `tool_name`, `call_id`, `arguments`, `is_error`, `text`, `text_hash`). |
 | `request_summary` (view) | `request_facts` without the arrays, plus `usage_by_request` aggregated per request: summed tokens, `attempts`, `failed_attempts`, `final_provider`/`final_auth_id` (last attempt), `cpa_session_id`. `attempts = 0` means no usage matched. |
@@ -19,13 +20,21 @@ the schema. Views carry a table-level comment.
 
 ## How rows are derived
 
-- **Loop**: every 30 s (`--interval`), process raw rows with
-  `ingested_at >= max(request_facts.ingested_at) - 1h` (whole table when empty)
-  that have no `request_facts` row yet, in `(ingested_at, request_id)` order,
-  50 per batch. `request_facts.ingested_at` is copied from the raw row, so the
-  watermark only moves over rows that were actually derived. A failed insert is
-  not retried within the pass: the pass stops and the next one's anti-join picks
-  the rows up.
+- **Loop**: every 30 s, process up to `--max-rows-per-pass` rows. Reserve
+  half for the newest five minutes, then spend the remaining allowance on the
+  oldest backlog. Each window runs in `(ingested_at, request_id)` order.
+  Candidates contain only IDs and timestamps, selected in one-hour windows.
+  Payload sizes choose batches before streaming bodies with `PREWHERE`, one read thread and one-row blocks.
+- **Checkpoint**: `deriver_progress` records copied raw ingestion times only
+  after successful backlog inserts. The backlog starts at its maximum minus one
+  hour, or the epoch when empty. Fresh inserts cannot advance this checkpoint.
+  The exact anti-join checks facts only for the candidate page IDs.
+  Failed inserts stop the pass without retry. A committed but unacknowledged
+  batch is skipped by the next anti-join. Existing installations start with an
+  empty checkpoint and rescan narrow IDs safely.
+- **Ordering**: `prior_seen` means previously processed. An old imported request
+  can see a newer live request from the same conversation. Rebuilds process
+  oldest first without the live lane, across bounded passes until empty.
 - **Messages emitted (tail rule)**: the first request seen for a
   `conversation_id` emits its whole input. Later requests emit only the input
   after the last model-produced item (assistant message, reasoning, thinking,
@@ -70,6 +79,24 @@ insert errors are logged as code and name only, because parse errors quote input
 
 The user needs write access to the database. The deriver waits, retrying every
 interval, until the plugin has created the raw schema.
+
+Recommended starting limits for a 1.5 GB ClickHouse container:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--batch-rows` | `16` | Maximum bodies and facts per batch. |
+| `--batch-bytes` | `8388608` | Raw payload bytes per batch. One oversized row runs alone. |
+| `--max-rows-per-pass` | `512` | Live plus backlog rows per pass, at least 2. |
+| `--query-memory-bytes` | `268435456` | ClickHouse memory cap per deriver query. |
+| `--interval` | `30s` | Delay after each pass. |
+
+The byte budget includes bodies, chunks, request headers and error text. It
+bounds payload, not total memory. JSON, extracted facts, decompression and one
+oversized row need extra memory. Every deriver query uses one thread and a 30-second execution limit. Normal
+passes have a two-minute deadline, so slow backlog work yields to the live lane
+on the next pass. Keep the writer's query memory cap enabled.
+Latency depends on live arrival rate and server load. See
+`../benchmarks/deriver-memory.md` for local measurements.
 
 ## Compose service
 

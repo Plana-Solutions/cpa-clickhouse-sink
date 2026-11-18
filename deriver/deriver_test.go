@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -282,5 +284,128 @@ func TestErrorMessagesDropRowData(t *testing.T) {
 	}
 	if got := chArray([]string{"a'b", `c\d`}); got != `['a\'b','c\\d']` {
 		t.Fatalf("chArray = %s", got)
+	}
+}
+
+func TestBodyBatchLimits(t *testing.T) {
+	rows := []candidate{{Bytes: 4}, {Bytes: 6}, {Bytes: 11}, {Bytes: 1}}
+	for _, tc := range []struct{ offset, budget, want int }{{0, 10, 2}, {0, 9, 1}, {2, 10, 1}, {3, 10, 1}} {
+		if got := len(bodyBatch(rows[tc.offset:], tc.budget)); got != tc.want {
+			t.Fatalf("offset %d budget %d: %d, want %d", tc.offset, tc.budget, got, tc.want)
+		}
+	}
+}
+
+func TestFreshRowsDoNotStrandBacklog(t *testing.T) {
+	d := testDeriver(t)
+	d.maxRows, d.batchSize, d.batchBytes = 4, 3, 1
+	base := time.Now().Add(-20 * time.Hour)
+	var rows []rawRow
+	for i := 0; i < 7; i++ {
+		rows = append(rows, fixtureRow(t, "chat_stream", fmt.Sprintf("old-%d", i), base.Add(time.Duration(i)*time.Hour)))
+	}
+	rows = append(rows, fixtureRow(t, "chat_stream", "live", time.Now().Add(-time.Minute)))
+	insertRaw(t, d, rows...)
+	var order []string
+	d.extract = func(r extract.Row, prior bool) extract.Facts {
+		order = append(order, r.RequestID)
+		return extract.Extract(r, prior)
+	}
+	n, err := d.pass(context.Background())
+	if err != nil || n != 4 {
+		t.Fatalf("first pass %d %v", n, err)
+	}
+	if strings.Join(order, ",") != "live,old-0,old-1,old-2" {
+		t.Fatalf("order %v", order)
+	}
+	// A process restart must retain the independent backlog checkpoint.
+	d2 := newDeriver(d.ch, testDB, d.log, d.redactor)
+	d2.maxRows = 4
+	n, err = d2.pass(context.Background())
+	if err != nil || n != 4 {
+		t.Fatalf("restart pass %d %v", n, err)
+	}
+	if got := scalar(t, d, "SELECT count(),uniqExact(request_id) FROM "+testDB+".request_facts"); got != "8\t8" {
+		t.Fatal(got)
+	}
+	n, err = d2.pass(context.Background())
+	if err != nil || n != 0 {
+		t.Fatalf("idle %d %v", n, err)
+	}
+	n, err = d2.rebuild(context.Background())
+	if err != nil || n != 8 {
+		t.Fatalf("bounded rebuild %d %v", n, err)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestCommittedButUnacknowledgedBatch(t *testing.T) {
+	d := testDeriver(t)
+	insertRaw(t, d, fixtureRow(t, "chat_stream", "lost-ack", time.Now().Add(-10*time.Hour)))
+	lost := false
+	d.ch.http.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		resp, err := http.DefaultTransport.RoundTrip(r)
+		if err == nil && !lost && strings.Contains(r.URL.Query().Get("query"), ".request_facts FORMAT") {
+			_, err = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if err != nil {
+				return nil, err
+			}
+			lost = true
+			return nil, errors.New("simulated lost acknowledgement")
+		}
+		return resp, err
+	})
+	if _, err := d.pass(context.Background()); err == nil {
+		t.Fatal("expected insert error")
+	}
+	if got := scalar(t, d, "SELECT count() FROM "+testDB+".deriver_progress"); got != "0" {
+		t.Fatal("checkpoint advanced", got)
+	}
+	if n, err := d.pass(context.Background()); err != nil || n != 0 {
+		t.Fatalf("retry %d %v", n, err)
+	}
+	if got := scalar(t, d, "SELECT count() FROM "+testDB+".request_facts"); got != "1" {
+		t.Fatal("duplicate", got)
+	}
+}
+
+func TestTimestampTiesAndPausedBacklog(t *testing.T) {
+	d := testDeriver(t)
+	d.batchSize, d.maxRows = 2, 4
+	paused := time.Now().Add(-15 * time.Minute)
+	var rows []rawRow
+	for i := 0; i < 11; i++ {
+		rows = append(rows, fixtureRow(t, "chat_stream", fmt.Sprintf("tie-%02d", i), paused))
+	}
+	insertRaw(t, d, rows...)
+	for pass := 0; pass < 4; pass++ {
+		next := newDeriver(d.ch, d.db, d.log, d.redactor)
+		next.batchSize, next.maxRows = 2, 4
+		n, err := next.pass(context.Background())
+		if err != nil || n > 4 {
+			t.Fatalf("pass %d: %d %v", pass, n, err)
+		}
+	}
+	if got := scalar(t, d, "SELECT count(),uniqExact(request_id) FROM "+testDB+".request_facts"); got != "11\t11" {
+		t.Fatal(got)
+	}
+}
+
+func TestDeriverQueriesCarryResourceLimits(t *testing.T) {
+	ch := newClickHouse("http://localhost", "", "")
+	ch.memoryBytes = 123456
+	ch.http.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		q := r.URL.Query()
+		if q.Get("max_threads") != "1" || q.Get("max_memory_usage") != "123456" || q.Get("max_execution_time") != "30" {
+			t.Fatalf("resource settings %v", q)
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(""))}, nil
+	})
+	if err := ch.exec(context.Background(), "SELECT 1", nil); err != nil {
+		t.Fatal(err)
 	}
 }

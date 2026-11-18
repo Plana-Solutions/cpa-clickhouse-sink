@@ -23,7 +23,15 @@ import (
 func main() {
 	rebuild := flag.Bool("rebuild", false, "truncate request_facts, derive all raw rows, then exit (stop the loop service first)")
 	interval := flag.Duration("interval", 30*time.Second, "time between passes")
+	batchRows := flag.Int("batch-rows", 16, "maximum bodies and facts per batch")
+	batchBytes := flag.Int("batch-bytes", 8<<20, "raw payload bytes per batch; one oversized row runs alone")
+	maxRows := flag.Int("max-rows-per-pass", 512, "maximum rows per pass; half reserved for fresh rows")
+	queryMemory := flag.Int64("query-memory-bytes", 256<<20, "ClickHouse memory limit per deriver query")
 	flag.Parse()
+	if *batchRows < 1 || *batchBytes < 1 || *maxRows < 2 || *interval <= 0 || *queryMemory < 1 {
+		fmt.Fprintln(os.Stderr, "batch and query memory limits must be positive, max-rows-per-pass >= 2, interval > 0")
+		os.Exit(2)
+	}
 
 	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -35,6 +43,7 @@ func main() {
 		os.Exit(1)
 	}
 	ch := newClickHouse(env("CLICKHOUSE_URL", "http://clickhouse:8123"), os.Getenv("CLICKHOUSE_USER"), password)
+	ch.memoryBytes = *queryMemory
 	r, errRedact := redact.New()
 	if errRedact != nil {
 		// Never derive text without redaction; compose restarts the service.
@@ -43,6 +52,8 @@ func main() {
 	}
 	r.Configure(splitList(os.Getenv("REDACT_FILES")), splitList(os.Getenv("REDACT_DISABLED_RULES")))
 	d := newDeriver(ch, env("CLICKHOUSE_DB", "cliproxy"), log, r)
+
+	d.batchSize, d.batchBytes, d.maxRows = *batchRows, *batchBytes, *maxRows
 
 	if err := waitSetup(ctx, d, *interval); err != nil {
 		log.Error("setup aborted", "err", err)

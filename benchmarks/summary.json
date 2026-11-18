@@ -1,0 +1,15 @@
+{
+  "after_runs": 5,
+  "baseline_failures": 5,
+  "median_seconds": 122.24317979100002,
+  "range_seconds": [
+    85.46969358299998,
+    134.807348708
+  ],
+  "median_rows_per_second": 19.632997146370833,
+  "range_rows_per_second": [
+    17.803183750750335,
+    28.080128749605844
+  ],
+  "peak_query_bytes": 28147251
+}

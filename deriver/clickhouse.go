@@ -14,14 +14,15 @@ import (
 
 // clickhouse is a minimal ClickHouse HTTP interface client.
 type clickhouse struct {
-	baseURL  string
-	user     string
-	password string
-	http     *http.Client
+	baseURL     string
+	user        string
+	password    string
+	http        *http.Client
+	memoryBytes int64
 }
 
 func newClickHouse(baseURL, user, password string) *clickhouse {
-	return &clickhouse{baseURL: strings.TrimRight(baseURL, "/") + "/", user: user, password: password, http: &http.Client{}}
+	return &clickhouse{baseURL: strings.TrimRight(baseURL, "/") + "/", user: user, password: password, http: &http.Client{}, memoryBytes: 256 << 20}
 }
 
 // do runs one statement. With data != nil the statement goes into the URL and
@@ -30,6 +31,9 @@ func newClickHouse(baseURL, user, password string) *clickhouse {
 func (c *clickhouse) do(ctx context.Context, query string, params map[string]string, data []byte) (io.ReadCloser, error) {
 	q := url.Values{}
 	q.Set("output_format_json_quote_64bit_integers", "0")
+	q.Set("max_threads", "1")
+	q.Set("max_execution_time", "30")
+	q.Set("max_memory_usage", fmt.Sprint(c.memoryBytes))
 	for k, v := range params {
 		q.Set("param_"+k, v)
 	}
@@ -74,6 +78,10 @@ func (c *clickhouse) exec(ctx context.Context, query string, params map[string]s
 
 // selectRows decodes a JSONEachRow result row by row into fn.
 func selectRows[T any](ctx context.Context, c *clickhouse, query string, params map[string]string, fn func(T)) error {
+	return streamRows(ctx, c, query, params, func(row T) error { fn(row); return nil })
+}
+
+func streamRows[T any](ctx context.Context, c *clickhouse, query string, params map[string]string, fn func(T) error) error {
 	rc, err := c.do(ctx, query+"\nFORMAT JSONEachRow", params, nil)
 	if err != nil {
 		return err
@@ -87,7 +95,9 @@ func selectRows[T any](ctx context.Context, c *clickhouse, query string, params 
 		} else if err != nil {
 			return fmt.Errorf("decode row: %w", err)
 		}
-		fn(row)
+		if err := fn(row); err != nil {
+			return err
+		}
 	}
 }
 

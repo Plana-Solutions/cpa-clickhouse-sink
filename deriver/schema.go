@@ -7,6 +7,7 @@ import "strings"
 // ALTER TABLE ... ADD COLUMN IF NOT EXISTS, or a new table; never edit the
 // CREATE below in place expecting it to migrate.
 var derivedSchema = []string{
+	`CREATE TABLE IF NOT EXISTS {db}.deriver_progress (ingested_at DateTime64(9, 'UTC') COMMENT 'Copied raw ingestion time of an acknowledged backlog batch') ENGINE=MergeTree ORDER BY ingested_at COMMENT 'Committed backlog watermark; fresh processing never advances it'`,
 	`CREATE TABLE IF NOT EXISTS {db}.request_facts
 (
     request_id             String COMMENT 'Lifecycle request ID; joins requests.request_id and usage_by_request.lifecycle_request_id',

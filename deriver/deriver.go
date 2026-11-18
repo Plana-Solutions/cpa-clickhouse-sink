@@ -14,17 +14,19 @@ const epoch = "1970-01-01 00:00:00.000000000"
 
 // deriver turns raw requests into request_facts rows.
 type deriver struct {
-	ch        *clickhouse
-	db        string
-	batchSize int
-	redactor  *redact.Redactor
-	log       *slog.Logger
+	ch         *clickhouse
+	db         string
+	batchSize  int
+	batchBytes int
+	maxRows    int
+	redactor   *redact.Redactor
+	log        *slog.Logger
 	// extract is extract.Extract; tests replace it to inject a poison row.
 	extract func(extract.Row, bool) extract.Facts
 }
 
 func newDeriver(ch *clickhouse, db string, log *slog.Logger, r *redact.Redactor) *deriver {
-	return &deriver{ch: ch, db: db, batchSize: 50, log: log, extract: extract.Extract, redactor: r}
+	return &deriver{ch: ch, db: db, batchSize: 16, batchBytes: 8 << 20, maxRows: 512, log: log, extract: extract.Extract, redactor: r}
 }
 
 // setup creates the derived table and views.
@@ -42,65 +44,100 @@ func (d *deriver) rebuild(ctx context.Context) (int, error) {
 	if err := d.ch.exec(ctx, "TRUNCATE TABLE "+d.db+".request_facts", nil); err != nil {
 		return 0, fmt.Errorf("truncate: %w", err)
 	}
-	return d.pass(ctx)
+	if err := d.ch.exec(ctx, "TRUNCATE TABLE "+d.db+".deriver_progress", nil); err != nil {
+		return 0, err
+	}
+	total := 0
+	for {
+		n, err := d.runWindow(ctx, epoch, "2100-01-01 00:00:00.000000000", d.maxRows, true)
+		total += n
+		if err != nil || n == 0 {
+			return total, err
+		}
+	}
 }
 
-// pass processes every raw row from the watermark on that has no facts row
-// yet, in (ingested_at, request_id) order. The watermark is
-// max(request_facts.ingested_at) - 1h, or the whole table when empty. A failed
-// insert is not retried here: the pass stops, so the watermark cannot move past
-// the failed rows, and the next pass's anti-join picks them up.
+// Fresh work cannot advance the durable backlog checkpoint.
 func (d *deriver) pass(ctx context.Context) (int, error) {
-	start := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	cutoff := time.Now().UTC().Add(-5 * time.Minute).Format("2006-01-02 15:04:05.000000000")
+	freshLimit := d.maxRows / 2
+	if freshLimit == 0 {
+		freshLimit = 1
+	}
+	n, err := d.runWindow(ctx, cutoff, "2100-01-01 00:00:00.000000000", freshLimit, false)
+	if err != nil {
+		return n, err
+	}
 	lower, err := d.watermark(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("watermark: %w", err)
+		return n, err
 	}
-	seen := map[string]bool{} // conversation_ids emitted in this pass
+	backlog, err := d.runWindow(ctx, lower, cutoff, d.maxRows-n, true)
+	return n + backlog, err
+}
+
+func (d *deriver) runWindow(ctx context.Context, lower, upper string, limit int, checkpoint bool) (int, error) {
+	start := time.Now()
 	cursorTS, cursorID := lower, ""
 	total := 0
-	statuses := map[string]int{}
-	for {
-		rows, err := d.fetch(ctx, lower, cursorTS, cursorID)
+	for total < limit {
+		count := limit - total
+		candidates, lastScanned, err := d.candidates(ctx, lower, upper, cursorTS, cursorID, min(count, d.batchSize))
 		if err != nil {
-			return total, fmt.Errorf("fetch: %w", err)
+			return total, fmt.Errorf("candidates: %w", err)
 		}
-		if len(rows) == 0 {
+		if lastScanned == nil {
 			break
 		}
-		convs := make([]string, len(rows))
-		var lookup []string
-		for i, r := range rows {
-			convs[i] = extract.Conversation(r)
-			if convs[i] != "" && !seen[convs[i]] {
-				lookup = append(lookup, convs[i])
+		cursorTS, cursorID = lastScanned.IngestedAt, lastScanned.RequestID
+		for len(candidates) > 0 {
+			batch := bodyBatch(candidates[:min(d.batchSize, len(candidates))], d.batchBytes)
+			ids := make([]string, len(batch))
+			for i, c := range batch {
+				ids[i] = c.RequestID
 			}
-		}
-		known, err := d.knownConversations(ctx, lookup)
-		if err != nil {
-			return total, fmt.Errorf("prior lookup: %w", err)
-		}
-		facts := make([]any, 0, len(rows))
-		for i, r := range rows {
-			f := d.safeExtract(r, seen[convs[i]] || known[convs[i]])
-			if f.ConversationID != "" {
-				seen[f.ConversationID] = true
+			var facts []any
+			seen := map[string]bool{}
+			err := d.fetch(ctx, ids, func(r extract.Row) error {
+				conv := extract.Conversation(r)
+				prior := seen[conv]
+				if !prior && conv != "" {
+					known, err := d.knownConversations(ctx, []string{conv})
+					if err != nil {
+						return err
+					}
+					prior = known[conv]
+				}
+				f := d.safeExtract(r, prior)
+				if f.ConversationID != "" {
+					seen[f.ConversationID] = true
+				}
+				facts = append(facts, toFactsRow(f))
+				return nil
+			})
+			if err != nil {
+				return total, fmt.Errorf("bodies: %w", err)
 			}
-			statuses[f.ParseStatus]++
-			facts = append(facts, toFactsRow(f))
-		}
-		if err := d.ch.insertJSON(ctx, d.db+".request_facts", facts); err != nil {
-			return total, fmt.Errorf("insert %d facts rows (first request_id %s): %w", len(facts), rows[0].RequestID, err)
-		}
-		total += len(rows)
-		last := rows[len(rows)-1]
-		cursorTS, cursorID = last.IngestedAt, last.RequestID
-		if len(rows) < d.batchSize {
-			break
+			if len(facts) != len(batch) {
+				return total, fmt.Errorf("expected %d raw rows, got %d", len(batch), len(facts))
+			}
+			if err := d.ch.insertJSON(ctx, d.db+".request_facts", facts); err != nil {
+				return total, fmt.Errorf("insert facts: %w", err)
+			}
+			last := batch[len(batch)-1]
+			total += len(batch)
+			if checkpoint {
+				if err := d.ch.insertJSON(ctx, d.db+".deriver_progress", []any{map[string]string{"ingested_at": last.IngestedAt}}); err != nil {
+					return total, fmt.Errorf("checkpoint: %w", err)
+				}
+			}
+			candidates = candidates[len(batch):]
 		}
 	}
 	if total > 0 {
-		d.log.Info("pass done", "rows", total, "statuses", statuses, "since", lower, "took", time.Since(start).Round(time.Millisecond))
+		d.log.Info("window done", "rows", total, "since", lower, "took", time.Since(start))
 	}
 	return total, nil
 }
@@ -128,7 +165,7 @@ func (d *deriver) watermark(ctx context.Context) (string, error) {
 		Rows  uint64 `json:"rows"`
 	}
 	var got wm
-	err := selectRows(ctx, d.ch, "SELECT max(ingested_at) - INTERVAL 1 HOUR AS lower, count() AS rows FROM "+d.db+".request_facts", nil,
+	err := selectRows(ctx, d.ch, "SELECT max(ingested_at) - INTERVAL 1 HOUR AS lower, count() AS rows FROM "+d.db+".deriver_progress", nil,
 		func(r wm) { got = r })
 	if err != nil {
 		return "", err
@@ -139,21 +176,78 @@ func (d *deriver) watermark(ctx context.Context) (string, error) {
 	return got.Lower, nil
 }
 
-func (d *deriver) fetch(ctx context.Context, lower, cursorTS, cursorID string) ([]extract.Row, error) {
-	q := `SELECT request_id, trace_id, started_at, ingested_at,
-    duration_ms, path, source_format, model, stream, outcome, status_code, error,
-    request_headers, request_body, response_body, response_chunks, redaction_count
+// candidate contains only scheduling metadata. Bodies never enter the sort.
+type candidate struct {
+	RequestID  string `json:"request_id"`
+	IngestedAt string `json:"ingested_at"`
+	Bytes      uint64 `json:"bytes"`
+}
+
+func bodyBatch(rows []candidate, budget int) []candidate {
+	var size uint64
+	for i, r := range rows {
+		if i > 0 && (r.Bytes > uint64(budget) || size > uint64(budget)-r.Bytes) {
+			return rows[:i]
+		}
+		size += r.Bytes
+	}
+	return rows
+}
+
+func (d *deriver) candidates(ctx context.Context, lower, upper, cursorTS, cursorID string, limit int) ([]candidate, *candidate, error) {
+	q := `WITH (SELECT min(ingested_at) + INTERVAL 1 HOUR FROM ` + d.db + `.requests
+ WHERE ingested_at >= {lower:DateTime64(9, 'UTC')} AND ingested_at < {upper:DateTime64(9, 'UTC')}
+ AND (ingested_at, request_id) > ({cts:DateTime64(9, 'UTC')}, {cid:String})) AS window_upper
+SELECT request_id, ingested_at
 FROM ` + d.db + `.requests
-WHERE ingested_at >= {lower:DateTime64(9, 'UTC')}
-  AND (ingested_at, request_id) > ({cts:DateTime64(9, 'UTC')}, {cid:String})
-  AND request_id NOT IN (
-      SELECT request_id FROM ` + d.db + `.request_facts WHERE ingested_at >= {lower:DateTime64(9, 'UTC')})
+WHERE ingested_at >= {lower:DateTime64(9, 'UTC')} AND ingested_at < {upper:DateTime64(9, 'UTC')}
+ AND ingested_at < window_upper
+ AND (ingested_at, request_id) > ({cts:DateTime64(9, 'UTC')}, {cid:String})
+ORDER BY ingested_at, request_id LIMIT {limit:UInt32} SETTINGS max_threads=1`
+	params := map[string]string{"lower": lower, "upper": upper, "cts": cursorTS, "cid": cursorID, "limit": fmt.Sprint(limit)}
+	var rows []candidate
+	err := selectRows(ctx, d.ch, q, params, func(r candidate) { rows = append(rows, r) })
+	if err != nil || len(rows) == 0 {
+		return rows, nil, err
+	}
+	last := rows[len(rows)-1]
+	ids := make([]string, len(rows))
+	for i, r := range rows {
+		ids[i] = r.RequestID
+	}
+	known := map[string]bool{}
+	err = selectRows(ctx, d.ch, "SELECT DISTINCT request_id FROM "+d.db+".request_facts WHERE request_id IN {ids:Array(String)}", map[string]string{"ids": chArray(ids)}, func(r candidate) { known[r.RequestID] = true })
+	if err != nil {
+		return nil, nil, err
+	}
+	pending := rows[:0]
+	ids = nil
+	for _, r := range rows {
+		if !known[r.RequestID] {
+			pending = append(pending, r)
+			ids = append(ids, r.RequestID)
+		}
+	}
+	rows = pending
+	if len(rows) == 0 {
+		return rows, &last, nil
+	}
+	sizes := map[string]uint64{}
+	err = selectRows(ctx, d.ch, `SELECT request_id, length(request_body)+length(response_body)+arraySum(arrayMap(x -> length(x),response_chunks))+length(toJSONString(request_headers))+length(error) AS bytes FROM `+d.db+`.requests PREWHERE request_id IN {ids:Array(String)} SETTINGS max_threads=1, max_block_size=1, preferred_block_size_bytes=1048576`, map[string]string{"ids": chArray(ids)}, func(r candidate) { sizes[r.RequestID] = r.Bytes })
+	for i := range rows {
+		rows[i].Bytes = sizes[rows[i].RequestID]
+	}
+	return rows, &last, err
+}
+
+func (d *deriver) fetch(ctx context.Context, ids []string, fn func(extract.Row) error) error {
+	q := `SELECT request_id, trace_id, started_at, ingested_at,
+ duration_ms, path, source_format, model, stream, outcome, status_code, error,
+ request_headers, request_body, response_body, response_chunks, redaction_count
+FROM ` + d.db + `.requests PREWHERE request_id IN {ids:Array(String)}
 ORDER BY ingested_at, request_id
-LIMIT {limit:UInt32}`
-	params := map[string]string{"lower": lower, "cts": cursorTS, "cid": cursorID, "limit": fmt.Sprint(d.batchSize)}
-	var rows []extract.Row
-	err := selectRows(ctx, d.ch, q, params, func(r extract.Row) { rows = append(rows, r) })
-	return rows, err
+SETTINGS max_threads=1, max_block_size=1, preferred_block_size_bytes=1048576`
+	return streamRows(ctx, d.ch, q, map[string]string{"ids": chArray(ids)}, fn)
 }
 
 func (d *deriver) knownConversations(ctx context.Context, ids []string) (map[string]bool, error) {
