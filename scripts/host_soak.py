@@ -1,4 +1,6 @@
 """Exercise the production host with synthetic bodies and verify every captured byte."""
+import base64
+import http.client
 import hashlib
 import json
 import sys
@@ -33,25 +35,42 @@ for attempt in range(60):
         break
     time.sleep(1)
 assert int(rows) == count + 9, (rows, count)
-records = [json.loads(line) for line in query("SELECT request_id,hex(body_sha256) AS sha FROM cliproxy.requests FORMAT JSONEachRow").splitlines()]
+records = [json.loads(line) for line in query("SELECT request_id,hex(body_sha256) AS sha,lineage,body_len,base64Encode(body_residual) residual,body_ref_offsets offsets,arrayMap(x->hex(x),body_refs) refs FROM cliproxy.requests FORMAT JSONEachRow").splitlines()]
+blobs = {}
+for line in query("SELECT lineage,hex(hash) hash,base64Encode(data) data FROM cliproxy.body_blobs LIMIT 1 BY lineage,hash FORMAT JSONEachRow").splitlines():
+    item = json.loads(line)
+    data = base64.b64decode(item["data"])
+    assert hashlib.sha256(data).hexdigest()[:32].upper() == item["hash"]
+    blobs[(str(item["lineage"]),item["hash"])] = data
 verified = 0
 for row in records:
     if row["sha"] not in expected:
         continue
-    result = query("SELECT body_status,hex(SHA256(request_body)) AS sha FROM cliproxy.raw_request(id='" + row["request_id"] + "') FORMAT JSONEachRow")
-    decoded = json.loads(result)
-    assert decoded["body_status"] == "complete" and decoded["sha"] == row["sha"], row["request_id"]
+    residual = base64.b64decode(row["residual"])
+    assert len(row["refs"]) == len(row["offsets"])
+    parts, last = [], 0
+    for ref, offset in zip(row["refs"],row["offsets"]):
+        assert last <= offset <= len(residual)
+        parts.extend([residual[last:offset],blobs[(str(row["lineage"]),ref)]])
+        last = offset
+    parts.append(residual[last:])
+    body = b"".join(parts)
+    assert len(body) == row["body_len"] and hashlib.sha256(body).hexdigest().upper() == row["sha"], row["request_id"]
     verified += 1
 assert verified == count, (verified, count)
 # Force a real 25.8 error after response headers and data have streamed.
-raw = query("SELECT number, throwIf(number=50000) FROM numbers(100000) SETTINGS max_block_size=1000 FORMAT JSONEachRow", buffer_size="1024", wait_end_of_query="0")
-lines = raw.splitlines()
-assert any(line.startswith(b'{"number":') for line in lines), "no prefix rows"
-assert b"Code:" in raw, "no mid-stream exception"
 try:
-    [json.loads(line) for line in lines]
-except (ValueError, UnicodeError):
-    pass
+    raw = query("SELECT number, throwIf(number=50000) FROM numbers(100000) SETTINGS max_block_size=1000 FORMAT JSONEachRow", buffer_size="1024", wait_end_of_query="0")
+except http.client.IncompleteRead as exc:
+    assert b'{"number":' in exc.partial, "no prefix rows before transport failure"
 else:
-    raise AssertionError("mid-stream exception decoded as data")
+    lines = raw.splitlines()
+    assert any(line.startswith(b'{"number":') for line in lines), "no prefix rows"
+    assert b"Code:" in raw, "no mid-stream exception"
+    try:
+        [json.loads(line) for line in lines]
+    except (ValueError, UnicodeError):
+        pass
+    else:
+        raise AssertionError("mid-stream exception decoded as data")
 print(json.dumps({"duration_seconds": elapsed, "synthetic_requests": count, "captured_requests": int(rows), "drops": int(count+9-int(rows)), "byte_exact": verified, "midstream_error": "rejected"}), flush=True)
