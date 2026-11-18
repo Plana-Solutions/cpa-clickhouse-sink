@@ -18,9 +18,9 @@ https://raw.githubusercontent.com/Plana-Solutions/cpa-clickhouse-sink/main/regis
 ```
 
 Refresh the store. Select **ClickHouse Sink (Plana ARM64)** from
-`Plana-Solutions/cpa-clickhouse-sink`, version `0.1.0-plana.5`.
+`Plana-Solutions/cpa-clickhouse-sink`, version `0.1.0-plana.6`.
 The release ZIP contains `clickhouse-sink.so`. Its name is
-`clickhouse-sink_0.1.0-plana.5_linux_arm64.zip`.
+`clickhouse-sink_0.1.0-plana.6_linux_arm64.zip`.
 `checksums.txt` lists ZIP hashes with bare filenames for CPA's installer.
 `SHA256SUMS` covers all other assets and `checksums.txt`.
 The deriver is a separate linux/arm64 binary. Building or publishing does not deploy it.

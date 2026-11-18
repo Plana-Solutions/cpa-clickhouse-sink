@@ -19,129 +19,227 @@ type migrationReport struct {
 	DryRun         bool   `json:"dry_run"`
 }
 
-// The remaining legacy rows are the checkpoint. A crash can only leave verified copies.
+type migrationBody struct {
+	migrationCandidate
+	Body    []byte            `json:"body"`
+	Headers map[string]string `json:"request_headers"`
+	SHA     string            `json:"sha"`
+}
+
 func (d *deriver) migrate(ctx context.Context, dry bool) (migrationReport, error) {
 	report := migrationReport{DryRun: dry}
-	type candidate struct {
-		ID string `json:"request_id"`
-		TS string `json:"started_at"`
-	}
-	var candidates []candidate
-	err := selectRows(ctx, d.ch, `SELECT DISTINCT request_id,started_at FROM `+d.db+`.requests
- WHERE request_body!='' AND request_id IN (SELECT request_id FROM `+d.db+`.request_facts)
- ORDER BY started_at,request_id SETTINGS max_threads=1`, nil, func(r candidate) { candidates = append(candidates, r) })
-	if err != nil {
+	if err := d.migrationMemory(ctx, 0.60); err != nil {
 		return report, err
 	}
-	dryKeys := map[bodystore.Key]bool{}
-	var verified []string
-	flush := func() error {
-		if len(verified) == 0 {
-			return nil
-		}
-		err := d.ch.exec(ctx, `DELETE FROM `+d.db+`.requests WHERE body_sha256=repeat(char(0),32) AND request_id IN {ids:Array(String)} SETTINGS lightweight_deletes_sync=1`, map[string]string{"ids": chArray(verified)})
-		if err == nil {
-			verified = nil
-		}
-		return err
-	}
-	for _, c := range candidates {
-		type row struct {
-			ID      string            `json:"request_id"`
-			TS      string            `json:"started_at"`
-			Body    []byte            `json:"body"`
-			Headers map[string]string `json:"request_headers"`
-			SHA     string            `json:"sha"`
-		}
-		r := row{ID: c.ID, TS: c.TS}
-		err := selectRows(ctx, d.ch, `SELECT request_id,started_at,base64Encode(request_body) AS body,request_headers,hex(SHA256(request_body)) AS sha FROM `+d.db+`.requests PREWHERE request_id={id:String} AND started_at={ts:DateTime64(9,'UTC')} WHERE request_body!='' LIMIT 1 SETTINGS max_threads=1,max_block_size=1,preferred_block_size_bytes=1048576`, map[string]string{"id": r.ID, "ts": r.TS}, func(v row) { r = v })
+	cursor := migrationCursor{migrationCandidate: migrationCandidate{TS: epoch}}
+	var dryCandidates []migrationCandidate
+	if dry {
+		var err error
+		dryCandidates, err = migrationRows[migrationCandidate](ctx, d.ch, "SELECT DISTINCT request_id,started_at FROM "+d.db+`.requests WHERE request_body!='' AND request_id IN (SELECT request_id FROM `+d.db+`.request_facts) ORDER BY started_at,request_id SETTINGS max_threads=1`, nil)
 		if err != nil {
 			return report, err
 		}
-		if r.SHA == "" {
-			continue
+	} else {
+		var err error
+		cursor, err = d.migrationQueue(ctx)
+		if err != nil {
+			return report, err
 		}
+	}
+	dryKeys := map[bodystore.Key]bool{}
+	for {
+		var candidates []migrationCandidate
+		if dry {
+			candidates = dryCandidates[:min(d.batchSize, len(dryCandidates))]
 
-		sk, items := bodystore.Split(r.Body)
-		lineage := bodystore.Lineage(r.Headers, r.Body)
+		} else {
+			var err error
+			candidates, err = d.nextMigrationCandidates(ctx, cursor)
+			if err != nil {
+				return report, err
+			}
+		}
+		if len(candidates) == 0 {
+			if !dry {
+				cursor.Done = true
+				return report, d.saveMigrationCursor(ctx, cursor)
+			}
+			return report, nil
+		}
+		var batch []migrationBody
+		size := 0
+		for _, c := range candidates {
+			rows, err := migrationRows[migrationBody](ctx, d.ch, `SELECT request_id,started_at,base64Encode(request_body) AS body,request_headers,hex(SHA256(request_body)) AS sha FROM `+d.db+`.requests PREWHERE request_id={id:String} AND started_at={ts:DateTime64(9,'UTC')} WHERE request_body!='' LIMIT 1 SETTINGS max_threads=1,max_block_size=1,preferred_block_size_bytes=1048576`, map[string]string{"id": c.ID, "ts": c.TS})
+			if err != nil {
+				return report, fmt.Errorf("read migration request %s: %w", c.ID, err)
+			}
+			if len(rows) != 0 {
+				r := rows[0]
+				if r.ID != c.ID || r.TS != c.TS {
+					return report, fmt.Errorf("migration returned unexpected row for %s", c.ID)
+				}
+				if len(batch) > 0 && size+len(r.Body) > d.batchBytes {
+					break
+				}
+				batch = append(batch, r)
+				size += len(r.Body)
+			}
+			cursor.migrationCandidate = c
+		}
+		if dry {
+			for len(dryCandidates) > 0 && (dryCandidates[0].TS < cursor.TS || (dryCandidates[0].TS == cursor.TS && dryCandidates[0].ID <= cursor.ID)) {
+				dryCandidates = dryCandidates[1:]
+			}
+		}
+		if err := d.migrationMemory(ctx, 0.75); err != nil {
+			return report, err
+		}
+		if err := migrationRetry(ctx, func() error { return d.migrateBatch(ctx, batch, dry, dryKeys, &report) }); err != nil {
+			return report, err
+		}
+		if !dry {
+			if err := d.saveMigrationCursor(ctx, cursor); err != nil {
+				return report, err
+			}
+			select {
+			case <-ctx.Done():
+				return report, ctx.Err()
+			case <-time.After(250 * time.Millisecond):
+			}
+		}
+	}
+}
+
+func (d *deriver) migrateBatch(ctx context.Context, rows []migrationBody, dry bool, dryKeys map[bodystore.Key]bool, report *migrationReport) error {
+	var blobs, skeletons []byte
+	ids := []string{}
+	digests := map[string][32]byte{}
+	keys := map[bodystore.Key]bool{}
+	projected := uint64(0)
+	inline := uint64(0)
+	for _, r := range rows {
 		digest := sha256.Sum256(r.Body)
 		if !strings.EqualFold(hex.EncodeToString(digest[:]), r.SHA) {
-			return report, bodystore.ErrIncomplete
+			return fmt.Errorf("migration request %s: %w", r.ID, bodystore.ErrIncomplete)
 		}
-		report.Rows++
-		report.InlineBytes += uint64(len(r.Body))
-		report.ProjectedBytes += uint64(len(sk.Residual) + len(sk.Refs)*20 + 36)
-		// Restrict key reads to this body, including for long conversations.
-		known := map[bodystore.Hash]bool{}
-		hashes := make([]string, 0, len(items))
+		sk, items := bodystore.Split(r.Body)
+		lineage := bodystore.Lineage(r.Headers, r.Body)
+		hashes := []string{}
 		for h := range items {
 			hashes = append(hashes, hex.EncodeToString(h[:]))
 		}
-		err = selectRows(ctx, d.ch, `SELECT hex(hash) AS hash_hex FROM `+d.db+`.body_blobs WHERE lineage={l:UInt64} AND hash IN (SELECT unhex(arrayJoin({hashes:Array(String)})))`, map[string]string{"l": fmt.Sprint(lineage), "hashes": chArray(hashes)}, func(v struct {
+		known, err := migrationRows[struct {
 			Hash string `json:"hash_hex"`
-		}) {
-			b, e := hex.DecodeString(v.Hash)
-			if e == nil && len(b) == 16 {
-				known[bodystore.Hash(b)] = true
-			}
-		})
+		}](ctx, d.ch, `SELECT hex(hash) AS hash_hex FROM `+d.db+`.body_blobs WHERE lineage={l:UInt64} AND hash IN (SELECT unhex(arrayJoin({hashes:Array(String)})))`, map[string]string{"l": fmt.Sprint(lineage), "hashes": chArray(hashes)})
 		if err != nil {
-			return report, err
+			return fmt.Errorf("load migration blobs %s: %w", r.ID, err)
+		}
+		for _, h := range known {
+			b, err := hex.DecodeString(h.Hash)
+			if err != nil || len(b) != 16 {
+				return fmt.Errorf("invalid blob hash for %s", r.ID)
+			}
+			keys[bodystore.Key{Lineage: lineage, Hash: bodystore.Hash(b)}] = true
+		}
+		ts, err := time.Parse("2006-01-02 15:04:05.999999999", r.TS)
+		if err != nil {
+			return err
 		}
 		for h, data := range items {
-			if known[h] || dryKeys[bodystore.Key{Lineage: lineage, Hash: h}] {
+			k := bodystore.Key{Lineage: lineage, Hash: h}
+			if keys[k] || dryKeys[k] {
 				continue
 			}
-			report.ProjectedBytes += uint64(len(data) + 40)
+			keys[k] = true
+			projected += uint64(len(data) + 40)
 			if dry {
 				if len(dryKeys) >= 1000000 {
-					return report, fmt.Errorf("dry-run exceeds the one-million-key memory limit")
+					return fmt.Errorf("dry-run exceeds the one-million-key memory limit")
 				}
-				dryKeys[bodystore.Key{Lineage: lineage, Hash: h}] = true
-				continue
+				dryKeys[k] = true
+			} else {
+				blobs = append(blobs, bodystore.EncodeBlob(lineage, h, data, ts)...)
 			}
-			ts, err := time.Parse("2006-01-02 15:04:05.999999999", r.TS)
+		}
+		skeletons, err = appendCandidate(skeletons, r.migrationCandidate)
+		if err != nil {
+			return err
+		}
+		skeletons = append(skeletons, bodystore.EncodeSkeleton(lineage, sk)...)
+		ids = append(ids, r.ID)
+		digests[r.ID] = digest
+		inline += uint64(len(r.Body))
+		projected += uint64(len(sk.Residual) + len(sk.Refs)*20 + 36)
+	}
+	if !dry && len(ids) > 0 {
+		if len(blobs) > 0 {
+			rc, err := d.ch.do(ctx, "INSERT INTO "+d.db+".body_blobs (lineage,hash,data,first_seen) SETTINGS insert_deduplicate=0 FORMAT RowBinary", nil, blobs)
 			if err != nil {
-				return report, err
-			}
-			data := bodystore.EncodeBlob(lineage, h, data, ts)
-			rc, err := d.ch.do(ctx, `INSERT INTO `+d.db+`.body_blobs (lineage,hash,data,first_seen) SETTINGS insert_deduplicate=0 FORMAT RowBinary`, nil, data)
-			if err != nil {
-				return report, err
+				return err
 			}
 			_, err = io.Copy(io.Discard, rc)
 			_ = rc.Close()
 			if err != nil {
-				return report, err
+				return err
 			}
 		}
-		if dry {
-			continue
-		}
-		params := map[string]string{"id": r.ID, "ts": r.TS}
+		p := map[string]string{"ids": chArray(ids)}
 		q := `INSERT INTO ` + d.db + `.requests SELECT req.* EXCEPT(duration_ms) REPLACE (
  '' AS request_body,sk.lineage AS lineage,sk.body_len AS body_len,sk.body_sha256 AS body_sha256,
  sk.body_residual AS body_residual,sk.body_ref_offsets AS body_ref_offsets,sk.body_refs AS body_refs)
- FROM (SELECT * FROM ` + d.db + `.requests PREWHERE request_id={id:String} AND started_at={ts:DateTime64(9,'UTC')} WHERE request_body!=''
- AND request_id NOT IN (SELECT request_id FROM ` + d.db + `.requests WHERE started_at={ts:DateTime64(9,'UTC')} AND body_sha256!=repeat(char(0),32))) AS req CROSS JOIN skeleton AS sk LIMIT 1`
-		if err := d.ch.external(ctx, q, params, bodystore.SkeletonStructure, bodystore.EncodeSkeleton(lineage, sk)); err != nil {
-			return report, err
+ FROM (SELECT * FROM ` + d.db + `.requests PREWHERE request_id IN {ids:Array(String)}
+ WHERE request_body!='' AND request_id NOT IN (SELECT request_id FROM ` + d.db + `.requests PREWHERE request_id IN {ids:Array(String)} WHERE body_sha256!=repeat(char(0),32))) req
+ INNER JOIN skeleton sk ON req.request_id=sk.request_id AND req.started_at=sk.started_at LIMIT 1 BY req.request_id`
+		if err := d.ch.external(ctx, q, p, candidateStructure+bodystore.SkeletonStructure, skeletons); err != nil {
+			return err
 		}
-
-		err = d.ch.exec(ctx, "SELECT throwIf(count()=0,'migrated skeleton missing') FROM "+d.db+".requests PREWHERE request_id={id:String} AND started_at={ts:DateTime64(9,'UTC')} WHERE body_sha256=unhex({sha:String})", map[string]string{"id": r.ID, "ts": r.TS, "sha": r.SHA})
-		if err != nil {
-			return report, fmt.Errorf("verify migrated skeleton %s: %w", r.ID, bodystore.ErrIncomplete)
+		if err := d.verifyMigrationBatch(ctx, ids, digests, false); err != nil {
+			return err
 		}
-		b, err := d.bodyReader().Read(ctx, r.ID, r.TS)
-		if err != nil || sha256.Sum256(b) != digest {
-			return report, fmt.Errorf("verify migrated request %s: %w", r.ID, bodystore.ErrIncomplete)
-		}
-		verified = append(verified, r.ID)
-		if len(verified) >= 100 {
-			if err := flush(); err != nil {
-				return report, err
-			}
+		if err := d.ch.exec(ctx, "DELETE FROM "+d.db+".requests WHERE request_id IN {ids:Array(String)} AND body_sha256=repeat(char(0),32) SETTINGS lightweight_deletes_sync=1", p); err != nil {
+			return err
 		}
 	}
-	return report, flush()
+	report.Rows += len(rows)
+	report.InlineBytes += inline
+	report.ProjectedBytes += projected
+	return nil
+}
+
+func (d *deriver) verifyMigrationBatch(ctx context.Context, ids []string, want map[string][32]byte, inline bool) error {
+	filter := "body_sha256!=repeat(char(0),32)"
+	hash := "hex(body_sha256)"
+	if inline {
+		filter = "body_sha256=repeat(char(0),32)"
+		hash = "hex(SHA256(request_body))"
+	}
+	rows, err := migrationRows[struct {
+		ID  string `json:"request_id"`
+		SHA string `json:"sha"`
+	}](ctx, d.ch, "SELECT request_id,"+hash+" AS sha FROM "+d.db+".requests PREWHERE request_id IN {ids:Array(String)} WHERE "+filter+" LIMIT 1 BY request_id", map[string]string{"ids": chArray(ids)})
+	if err != nil {
+		return fmt.Errorf("verify migration batch: %w", err)
+	}
+	seen := map[string]bool{}
+	for _, r := range rows {
+		digest, ok := want[r.ID]
+		if !ok || !strings.EqualFold(r.SHA, hex.EncodeToString(digest[:])) {
+			return fmt.Errorf("verify migration request %s: %w", r.ID, bodystore.ErrIncomplete)
+		}
+		seen[r.ID] = true
+	}
+	for _, id := range ids {
+		if !seen[id] {
+			return fmt.Errorf("verify migration request %s: %w", id, bodystore.ErrIncomplete)
+		}
+	}
+	if inline {
+		return nil
+	}
+	return d.bodyReader().ReadBatch(ctx, ids, func(id, ts string, body []byte) error {
+		if sha256.Sum256(body) != want[id] {
+			return fmt.Errorf("verify migrated request %s: %w", id, bodystore.ErrIncomplete)
+		}
+		return nil
+	})
 }

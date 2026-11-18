@@ -31,7 +31,7 @@ func TestBodyIntegration(t *testing.T) {
 	const db = "cliproxy_body_test"
 	runStarted := time.Now().UTC().Format("2006-01-02 15:04:05.000000")
 	query := func(ctx context.Context, q string, p map[string]string) (io.ReadCloser, error) {
-		vals := url.Values{"output_format_json_quote_64bit_integers": {"0"}, "max_threads": {"1"}, "max_memory_usage": {"1073741824"}}
+		vals := url.Values{"output_format_json_quote_64bit_integers": {"0"}, "http_write_exception_in_output_format": {"0"}, "max_threads": {"1"}, "max_memory_usage": {"1073741824"}}
 		for k, v := range p {
 			vals.Set("param_"+k, v)
 		}
@@ -232,6 +232,13 @@ func TestBodyIntegration(t *testing.T) {
 		b, err := reader.Read(context.Background(), r.RequestID, r.StartedAt)
 		if err != nil || !bytes.Equal(b, []byte(r.RequestBody)) {
 			t.Fatal("restored body", r.RequestID, err)
+		}
+	}
+	t.Logf("second migration %s", run("migrate-bodies"))
+	for _, r := range rows {
+		b, err := reader.Read(context.Background(), r.RequestID, r.StartedAt)
+		if err != nil || !bytes.Equal(b, []byte(r.RequestBody)) {
+			t.Fatal("second migration body", r.RequestID, err)
 		}
 	}
 	// Restore corruption checks after the backlog run so every prior comparison uses valid data.

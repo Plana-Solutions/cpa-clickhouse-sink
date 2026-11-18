@@ -179,7 +179,7 @@ func (s *sink) prepareBodies(ctx context.Context, cfg sinkConfig, u *bodyUnit) {
 	u.blobs = binaryBatch("body_blobs", "lineage,hash,data,first_seen", rows)
 }
 
-// Bad blob rows fall back to inline requests. Transient failures keep immutable tokens.
+// Bad blob rows fall back to inline requests.
 func (s *sink) insertBlobs(cfg sinkConfig, b batch, keys []bodystore.Key, bad map[bodystore.Key]bool) error {
 	if len(b.rows) == 0 {
 		return nil

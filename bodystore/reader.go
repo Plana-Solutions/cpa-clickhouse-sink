@@ -164,6 +164,9 @@ func (row Body) Restore(blobs map[Key][]byte) ([]byte, error) {
 func DecodeRow(dec *json.Decoder, row any) error {
 	var raw json.RawMessage
 	if err := dec.Decode(&raw); err != nil {
+		if b, _ := io.ReadAll(io.LimitReader(dec.Buffered(), 4096)); strings.Contains(string(b), "Code:") {
+			return streamError(b)
+		}
 		return err
 	}
 	var envelope struct {
@@ -173,7 +176,70 @@ func DecodeRow(dec *json.Decoder, row any) error {
 		return err
 	}
 	if len(envelope.Exception) != 0 {
-		return fmt.Errorf("ClickHouse stream exception")
+		return streamError(envelope.Exception)
 	}
 	return json.Unmarshal(raw, row)
+}
+
+// StreamError preserves an exception code without exposing query or body content.
+type StreamError struct{ Code int }
+
+func (e *StreamError) Error() string {
+	return fmt.Sprintf("ClickHouse stream exception, code %d", e.Code)
+}
+func streamError(raw []byte) error {
+	code := 0
+	if i := strings.Index(string(raw), "Code: "); i >= 0 {
+		_, _ = fmt.Sscanf(string(raw[i:]), "Code: %d", &code)
+	}
+	return &StreamError{Code: code}
+}
+
+// ReadBatch reconstructs only bodies, without loading response payloads or other capture fields.
+func (r Reader) ReadBatch(ctx context.Context, ids []string, fn func(string, string, []byte) error) error {
+	blobs, err := r.Load(ctx, ids)
+	if err != nil {
+		return err
+	}
+	pending := make(map[string]bool, len(ids))
+	vals := make([]string, len(ids))
+	for i, id := range ids {
+		pending[id] = true
+		vals[i] = "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(id) + "'"
+	}
+	rc, err := r.Query(ctx, "SELECT request_id,started_at,"+Projection+" FROM "+r.Database+`.requests PREWHERE request_id IN {ids:Array(String)} ORDER BY body_sha256=repeat(char(0),32) LIMIT 1 BY request_id SETTINGS max_threads=1,max_block_size=1,preferred_block_size_bytes=1048576 FORMAT JSONEachRow`, map[string]string{"ids": "[" + strings.Join(vals, ",") + "]"})
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	dec := json.NewDecoder(rc)
+	for {
+		var row struct {
+			ID string `json:"request_id"`
+			TS string `json:"started_at"`
+			Body
+		}
+		err := DecodeRow(dec, &row)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if !pending[row.ID] {
+			return fmt.Errorf("unexpected or duplicate request id in body batch")
+		}
+		delete(pending, row.ID)
+		body, err := row.Body.Restore(blobs)
+		if err != nil {
+			return fmt.Errorf("request %s: %w", row.ID, err)
+		}
+		if err := fn(row.ID, row.TS, body); err != nil {
+			return err
+		}
+	}
+	if len(pending) != 0 {
+		return fmt.Errorf("body batch missing %d requested ids", len(pending))
+	}
+	return nil
 }

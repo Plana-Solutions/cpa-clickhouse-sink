@@ -53,9 +53,7 @@ func (c sinkConfig) equal(o sinkConfig) bool {
 		strings.Join(c.DisabledRules, "\x00") == strings.Join(o.DisabledRules, "\x00")
 }
 
-// batch is an insert unit. Once cut, its rows and token never change, so a
-// retry after an ambiguous failure is deduplicated by ClickHouse
-// (insert_deduplication_token + non_replicated_deduplication_window).
+// Legacy and usage batches keep stable tokens across retries. Body batches allow re-inserts after repair.
 type batch struct {
 	format  string
 	columns string

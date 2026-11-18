@@ -48,19 +48,24 @@ func (d *deriver) setup(ctx context.Context) error {
 // rebuild truncates request_facts and derives everything again.
 func (d *deriver) rebuild(ctx context.Context) (int, error) {
 	// Validate before destructive writes. Writers and blob GC must be stopped for rebuild.
-	type row struct {
-		ID string `json:"request_id"`
-		TS string `json:"started_at"`
-	}
-	var rows []row
-	err := selectRows(ctx, d.ch, "SELECT DISTINCT request_id,started_at FROM "+d.db+".requests WHERE body_sha256!=repeat(char(0),32) SETTINGS max_threads=1", nil, func(r row) { rows = append(rows, r) })
+
+	rows, err := migrationRows[candidate](ctx, d.ch, "SELECT request_id,body_len AS bytes FROM "+d.db+".requests WHERE body_sha256!=repeat(char(0),32) ORDER BY started_at,request_id LIMIT 1 BY request_id", nil)
 	if err != nil {
 		return 0, err
 	}
-	for _, r := range rows {
-		if _, err := d.bodyReader().Read(ctx, r.ID, r.TS); err != nil {
-			return 0, fmt.Errorf("rebuild refused before truncate: %w", err)
+	for len(rows) > 0 {
+		batch := bodyBatch(rows[:min(d.batchSize, len(rows))], d.batchBytes)
+		ids := make([]string, len(batch))
+		for i, r := range batch {
+			ids[i] = r.RequestID
 		}
+		err := migrationRetry(ctx, func() error {
+			return d.bodyReader().ReadBatch(ctx, ids, func(id, ts string, body []byte) error { return nil })
+		})
+		if err != nil {
+			return 0, fmt.Errorf("rebuild refused before truncate for batch %v: %w", ids, err)
+		}
+		rows = rows[len(batch):]
 	}
 
 	if err := d.ch.exec(ctx, "TRUNCATE TABLE "+d.db+".request_facts", nil); err != nil {
