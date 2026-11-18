@@ -135,3 +135,48 @@ func TestSchemaCopiesMatch(t *testing.T) {
 		t.Fatal("raw and embedded body schemas differ")
 	}
 }
+
+func TestBodyRetryKeepsDestination(t *testing.T) {
+	var a, b []string
+	failed := false
+	server := func(calls *[]string, fail bool) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			q := r.URL.Query().Get("query")
+			if q == "" {
+				return
+			}
+			kind := "requests"
+			if strings.Contains(q, "body_blobs") {
+				kind = "blobs"
+			}
+			*calls = append(*calls, kind)
+			if fail && kind == "requests" && !failed {
+				failed = true
+				w.WriteHeader(503)
+			}
+		}))
+	}
+	first := server(&a, true)
+	defer first.Close()
+	second := server(&b, false)
+	defer second.Close()
+	cfg := sinkConfig{URL: first.URL, Database: "test", BodyDedup: true}
+	s := newSink(cfg)
+	s.schemaOK = true
+	row := requestRow{RequestHeaders: map[string]string{"session-id": "same"}, RequestBody: `{"messages":["same"]}`}
+	s.addRequest(row)
+	s.flushNow()
+	if s.schemaOK {
+		t.Fatal("failed body insert retained schema state")
+	}
+	cfg.URL = second.URL
+	s.reconfigure(cfg)
+	s.addRequest(row)
+	s.flushNow()
+	if strings.Join(a, ",") != "blobs,requests,requests" || strings.Join(b, ",") != "blobs,requests" {
+		t.Fatal(a, b)
+	}
+	if s.buffered != 0 {
+		t.Fatal("buffer not released")
+	}
+}

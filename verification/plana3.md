@@ -42,3 +42,5 @@ Real ClickHouse testing caught alias substitution in the hash lookup and migrati
 Rollout instructions and config are in [BODY_STORAGE.md](../BODY_STORAGE.md). Deploy dual-format deriver and UI/export readers first, then enable the plugin flag, then run migration. Blob partition retention cannot follow request partition retention directly. External independent review is owned by the parent workflow; this implementation agent did not spawn reviewers.
 
 The initial native ARM64 workflow passed vet and race tests but failed its ABI assertion because the release verifier still expected the old plugin version. The assertion and registry now name v0.1.0-plana.3.
+
+Automated PR review found two retry gaps after the first publication. The final release pins each retry unit to its original destination, scopes the acknowledged-hash cache to the destination, and invalidates schema state after body-write failures. Regression tests fail a request insert, change the destination, and verify old retries stay on the old server while the new server receives its own blobs. The v0.1.0-plana.3 tag and assets were refreshed before handoff.

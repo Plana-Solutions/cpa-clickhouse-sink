@@ -20,6 +20,8 @@ type bodyRequest struct {
 	blobs   map[bodystore.Hash][]byte
 }
 type bodyUnit struct {
+	cfg         sinkConfig
+	schemaOK    bool
 	requests    []bodyRequest
 	blobs, rows *batch
 	keys        []bodystore.Key
@@ -68,6 +70,10 @@ func (s *sink) addRequest(row requestRow) {
 // Only the flush goroutine owns the acknowledged-hash cache.
 func (s *sink) lineage(cfg sinkConfig, l uint64) *knownLineage {
 	now := time.Now()
+	if !s.cacheCfg.equal(cfg) {
+		s.known = nil
+		s.cacheCfg = cfg
+	}
 	if s.known == nil {
 		s.known = map[uint64]*knownLineage{}
 	}
@@ -204,7 +210,7 @@ func (s *sink) flushBodies(cfg sinkConfig) error {
 		s.mu.Lock()
 		u := s.bodyRetry
 		if u == nil && len(s.bodyPending) > 0 {
-			u = &bodyUnit{requests: s.bodyPending, size: s.bodyPendingSize}
+			u = &bodyUnit{requests: s.bodyPending, size: s.bodyPendingSize, cfg: cfg, schemaOK: true}
 			s.bodyPending = nil
 			s.bodyPendingSize = 0
 			s.bodyRetry = u
@@ -213,12 +219,19 @@ func (s *sink) flushBodies(cfg sinkConfig) error {
 		if u == nil {
 			return nil
 		}
+		if !u.schemaOK {
+			if err := s.ensureSchema(u.cfg); err != nil {
+				return err
+			}
+			u.schemaOK = true
+		}
 		if u.rows == nil {
 			if u.blobs == nil {
-				s.prepareBodies(cfg, u)
+				s.prepareBodies(u.cfg, u)
 			}
 			bad := map[bodystore.Key]bool{}
-			if err := s.insertBlobs(cfg, *u.blobs, u.keys, bad); err != nil {
+			if err := s.insertBlobs(u.cfg, *u.blobs, u.keys, bad); err != nil {
+				u.schemaOK = false
 				return err
 			}
 			rows := make([][]byte, 0, len(u.requests))
@@ -241,7 +254,8 @@ func (s *sink) flushBodies(cfg sinkConfig) error {
 			u.requests = nil
 			u.keys = nil
 		}
-		if err := s.insertBatch(cfg, *u.rows); err != nil {
+		if err := s.insertBatch(u.cfg, *u.rows); err != nil {
+			u.schemaOK = false
 			return err
 		}
 		s.release(u.size)

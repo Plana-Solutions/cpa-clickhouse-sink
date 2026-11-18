@@ -78,6 +78,7 @@ func newBatch(table string, rows [][]byte) batch {
 
 // sink batches JSONEachRow rows per table and inserts them over HTTP.
 type sink struct {
+	cacheCfg                   sinkConfig
 	bodyPending                []bodyRequest
 	bodyPendingSize            int
 	bodyRetry                  *bodyUnit
@@ -219,6 +220,9 @@ func (s *sink) flushNow() {
 		s.mu.Unlock()
 	}
 	if err := s.flushBodies(cfg); err != nil {
+		s.mu.Lock()
+		s.schemaOK = false
+		s.mu.Unlock()
 		s.keep(batches)
 		s.report(err)
 		return

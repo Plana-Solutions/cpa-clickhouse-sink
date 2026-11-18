@@ -35,7 +35,7 @@ Only nonempty inline rows whose request ID already has facts qualify. The comman
 
 ## Retry and retention rules
 
-The plugin buffers skeletons and owned item bytes, never the original full request body. It inserts blobs before their requests. A transient blob failure blocks later units. A request failure retries the unchanged request batch without reinserting its successful blob batch. HTTP 400 bisection of blobs converts affected requests back to inline storage.
+The plugin buffers skeletons and owned item bytes, never the original full request body. It inserts blobs before their requests. A transient blob failure blocks later units. A request failure retries the unchanged request batch without reinserting its successful blob batch. Each in-flight unit retains its original destination across config changes. The hash cache is scoped to the destination, and failed body writes invalidate schema state before retry. HTTP 400 bisection of blobs converts affected requests back to inline storage.
 
 The acknowledged-hash cache holds at most 512 lineages and 100,000 hashes per lineage. Entries expire after 24 hours idle. First sight loads committed hashes with a lineage range query. Lineage zero is never preloaded. A failed preload resends identical items. Duplicate items from concurrent writers are harmless; readers choose one copy per key.
 
