@@ -1,6 +1,6 @@
 # Migrate existing inline bodies on the 2 GB production server
 
-This procedure targets ClickHouse 25.8 with a 2 GiB container, a 0.75 server memory ratio, a 64 MiB mark cache, four background merge workers, `merge_max_block_size=256`, and a 2 GiB maximum merge size. New capture already uses dedup. Publication does not apply these steps to production.
+This procedure targets ClickHouse 25.8 with a 2 GiB container, a 0.75 server memory ratio, a 64 MiB mark cache, four background merge workers, `merge_max_block_size=256`, and a 2 GiB maximum merge size. New capture already uses dedup. The production logger runs at warning level. Production also disables text_log, trace_log, metric_log, asynchronous_metric_log, query_thread_log, part_log, processors_profile_log and query_log, and sets uncompressed_cache_size=0. These settings were verified through a read-only Portainer archive request. They matter to the memory qualification. Publication does not apply these steps to production.
 
 ## Prepare permissions and a rollback copy
 
@@ -69,3 +69,11 @@ Sample `SELECT body_status FROM cliproxy.raw_request(id='...')`. Require `comple
 Stopping migration is the immediate rollback. Readers support both formats, so completed batches need no reversal. Preserve the backup table until independent verification and an agreed retention period have passed.
 
 To restore inline storage, disable new dedup writes, stop migration, and run `restore-bodies --dry-run`, then `restore-bodies` with the same grants and memory limits. This expands disk usage. Keep the new reader and deriver until restoration is verified. The backup hard links remain the recovery source if reconstruction cannot proceed. Do not automate backup reinsertion and skeleton deletion without isolating affected IDs and checking the restored hashes.
+
+## Measurements and planning
+
+See [the qualification record](verification/plana8.md) for the corpus, query memory and read-byte counters, concurrent-load results, failed trials and limitations. The production code-241 lookup failure did not reproduce in the synthetic fixture, so the measured lookup improvement must not be described as a reproduced production fix.
+
+The production-matched qualification completed 3,225 conversions and 597 live writes in 607 seconds, with zero insert errors, new code-241 events, drops, OOM kills or ClickHouse restarts. Five-second sampled server RSS peaked at 1.23 GiB and tracked memory at 445 MiB.
+
+At the measured 5.31 rows/s, 8,000 rows take about 25 minutes. Production rows and response fields can be larger than this synthetic request-heavy fixture. Plan **45 to 90 minutes** for migration, the dry run, admission waits and verification. This is an extrapolation, not a production timing guarantee. Background disk reclamation is asynchronous and is not included.
