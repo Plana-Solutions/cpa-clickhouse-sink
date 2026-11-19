@@ -11,7 +11,7 @@ type migrationCursor struct {
 }
 
 // The snapshot is durable before its cursor can advance. Only verified deletes advance it.
-func (d *deriver) migrationQueue(ctx context.Context) (migrationCursor, error) {
+func (d *deriver) migrationQueue(ctx context.Context, skippedIDs []string) (migrationCursor, error) {
 	for _, q := range []string{
 		"CREATE TABLE IF NOT EXISTS " + d.db + ".body_migration_candidates (request_id String, started_at DateTime64(9,'UTC')) ENGINE=MergeTree ORDER BY (started_at,request_id)",
 		"CREATE TABLE IF NOT EXISTS " + d.db + ".body_migration_progress (request_id String, started_at DateTime64(9,'UTC'), done Bool, saved_at DateTime64(9,'UTC') DEFAULT now64(9)) ENGINE=MergeTree ORDER BY saved_at",
@@ -32,8 +32,8 @@ func (d *deriver) migrationQueue(ctx context.Context) (migrationCursor, error) {
 			return migrationCursor{}, err
 		}
 	}
-	q := "INSERT INTO " + d.db + `.body_migration_candidates SELECT DISTINCT request_id,started_at FROM ` + d.db + `.requests WHERE length(request_body)>0 AND request_id IN (SELECT request_id FROM ` + d.db + `.request_facts) SETTINGS max_threads=1,max_block_size=1,preferred_block_size_bytes=1048576,insert_deduplicate=0`
-	if err := d.migrationExec(ctx, q, nil); err != nil {
+	q := "INSERT INTO " + d.db + `.body_migration_candidates SELECT DISTINCT request_id,started_at FROM ` + d.db + `.requests PREWHERE request_id NOT IN {skipped_ids:Array(String)} WHERE length(request_body)>0 AND length(request_body)<={body_limit:UInt64} AND request_id IN (SELECT request_id FROM ` + d.db + `.request_facts) SETTINGS max_threads=1,max_block_size=1,preferred_block_size_bytes=1048576,insert_deduplicate=0`
+	if err := d.migrationExec(ctx, q, map[string]string{"body_limit": fmt.Sprint(d.ch.memoryBytes / 8), "skipped_ids": chArray(skippedIDs)}); err != nil {
 		return migrationCursor{}, err
 	}
 	cursor := migrationCursor{migrationCandidate: migrationCandidate{TS: epoch}}

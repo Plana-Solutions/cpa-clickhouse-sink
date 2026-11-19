@@ -4,7 +4,7 @@ This procedure targets ClickHouse 25.8 with a 2 GiB container, a 0.75 server mem
 
 ## Prepare permissions and a rollback copy
 
-1. Verify the plana.9 assets against `SHA256SUMS`. Deploy the new reader view and deriver before migration. Keep the existing 16-row and 8 MiB batch limits. The normal deriver retains its 256 MiB query cap. Migration and restore default to a 128 MiB query cap. This covers inline request bodies up to 16 MiB. Migration refuses larger bodies at the size preflight before the candidate snapshot or payload reads.
+1. Verify the plana.10 assets against `SHA256SUMS`. Deploy the new reader view and deriver before migration. Keep the existing 16-row and 8 MiB batch limits. The normal deriver retains its 256 MiB query cap. Migration and restore default to a 128 MiB query cap. This covers inline request bodies up to 16 MiB. Migration skips larger bodies, leaves their inline copies untouched, and reports `skipped_rows`, `skipped_bytes`, and `skipped_request_ids` in both dry-run and real-run JSON. Each skip logs only its request ID and byte length. The safe per-row limit is `query-memory-bytes / 8`, inclusive. Skips do not prevent the cursor reaching `done=true`.
 2. Confirm normal capture and derivation work without code 241 or OOM kills. Stop any other migration or restore command. Keep capture and the normal deriver running.
 3. An operator must add the following entries to the existing migration user's `users.d` XML grants. Keep its existing `GRANT ALL ON cliproxy.*` entry. These grants are required only by migration and restore. The normal reader needs no system grants.
 
@@ -17,12 +17,12 @@ This procedure targets ClickHouse 25.8 with a 2 GiB container, a 0.75 server mem
    ```
 
    Edit `/opt/cpa/clickhouse/users.d/plana-users.xml` in place. It is a single read-only bind-mounted file. Preserve its inode with `sudo -n sh -c 'cat prepared-users.xml > /opt/cpa/clickhouse/users.d/plana-users.xml'`. Never use `sed -i`, an atomic rename, or an editor that replaces the file. Those writes leave the container on the old inode and silently retain the old grants until restart. Wait at least five seconds, then test every grant as `cliproxy`, including the monitoring queries below. Do not put a password in shell arguments or logs. A database-only user fails safely at the memory preflight. A missing purge privilege fails safely if memory pressure later requires a purge.
-4. Confirm that every legacy row has a fact. The command only snapshots derived rows. Use size predicates so ClickHouse does not select full body rows. Check the largest inline body first.
+4. Confirm that every legacy row has a fact. The command only snapshots derived rows. Use size-only projections and one-row blocks. ClickHouse 25.8 still reads the String column to evaluate `length`; these queries avoid projecting payloads or materializing large multi-row blocks. Check the largest inline body first.
 
    ```sql
    SELECT max(length(request_body)) AS max_inline_body_bytes
    FROM cliproxy.requests
-   SETTINGS max_threads=1,max_execution_time=300,max_memory_usage=134217728;
+   SETTINGS max_threads=1,max_block_size=1,max_execution_time=300,max_memory_usage=134217728;
 
    SELECT count() FROM cliproxy.requests
    WHERE length(request_body)>0 AND request_id NOT IN
@@ -30,7 +30,16 @@ This procedure targets ClickHouse 25.8 with a 2 GiB container, a 0.75 server mem
    SETTINGS max_threads=1,max_block_size=1,max_memory_usage=268435456;
    ```
 
-   Require zero underived legacy rows and `max_inline_body_bytes <= 16777216` with the shipped defaults. The tool repeats the maximum-length preflight, requires `query-memory-bytes >= 8 * max_inline_body_bytes`, and checks available server headroom. Do not raise the query cap without repeating the live-load qualification for the larger bodies and full response fields.
+   Require zero underived legacy rows. With the shipped defaults, rows above 16,777,216 bytes stay inline. The tool scans IDs and sizes for its skip report, excludes the reported oversized IDs in the snapshot PREWHERE before reading bodies, filters snapshot and payload reads by the per-row limit, and checks available server headroom. Record the oversized rows before migration using the query below. Compare this manifest with the final report and the backup after migration.
+
+   ```sql
+   SELECT request_id,started_at,length(request_body) AS bytes,hex(SHA256(request_body)) AS sha256
+   FROM cliproxy.requests WHERE length(request_body)>16777216
+   ORDER BY request_id,started_at
+   SETTINGS max_threads=1,max_block_size=1,max_memory_usage=134217728;
+   ```
+
+   Keep the protocol item-count precondition from the independent plana.9 review. Eligible bodies must have at most 3,000 protocol items because migration blob lookup parameters still use the HTTP URL. The measured production maximum of 843 meets this condition. Do not raise the query cap without repeating the live-load qualification for the larger bodies and full response fields.
 
 5. Save `SHOW CREATE TABLE cliproxy.requests`. Create a rollback table and attach each active request partition from the source. This uses hard links, keeps the original body bytes available, and avoids a full-body backup query. Run as an operator with the database permissions. Replace the month with each existing partition. Keep at least 10 GB free for diverging parts and merges.
 
@@ -42,7 +51,19 @@ This procedure targets ClickHouse 25.8 with a 2 GiB container, a 0.75 server mem
 
 ## Run and monitor
 
-On the production Docker host for Portainer stack 29, use its `cpa-clickhouse_default` network and existing writer secret mount. Build and verify `cpa-local/clickhouse-deriver:v0.1.0-plana.9` from the released binary before running. The normal deriver remains on its own 384 MiB container. The one-off migration container uses 768 MiB for Go body splitting and verification. Do not pass secrets on the command line.
+On the production Docker host for Portainer stack 29, use its `cpa-clickhouse_default` network and existing writer secret mount. Build and verify `cpa-local/clickhouse-deriver:v0.1.0-plana.10` from the released binary before running. The normal deriver remains on its own 384 MiB container. The one-off migration container uses 768 MiB for Go body splitting and verification. Do not pass secrets on the command line.
+
+Download `clickhouse-deriver-linux-arm64` and `SHA256SUMS` from the plana.10 release into an empty build directory. Verify the binary before building. The previous image supplies the existing entrypoint and runtime, as production did for plana.9.
+
+```sh
+awk '$2 == "clickhouse-deriver-linux-arm64" {print; found=1} END {if (!found) exit 1}' SHA256SUMS > deriver.sha256
+sha256sum --check deriver.sha256
+cat > Dockerfile <<'DOCKERFILE'
+FROM cpa-local/clickhouse-deriver:v0.1.0-plana.9
+COPY --chmod=0555 clickhouse-deriver-linux-arm64 /deriver
+DOCKERFILE
+sudo -n docker build -t cpa-local/clickhouse-deriver:v0.1.0-plana.10 .
+```
 
 ```sh
 sudo -n docker run --rm --name cpa-body-migration-dry \
@@ -52,7 +73,7 @@ sudo -n docker run --rm --name cpa-body-migration-dry \
   -e CLICKHOUSE_DB=cliproxy -e CLICKHOUSE_USER=cliproxy \
   -e CLICKHOUSE_PASSWORD_FILE=/run/secrets/ch_writer \
   -v /opt/cpa/clickhouse/secrets/ch_writer:/run/secrets/ch_writer:ro \
-  cpa-local/clickhouse-deriver:v0.1.0-plana.9 migrate-bodies --dry-run
+  cpa-local/clickhouse-deriver:v0.1.0-plana.10 migrate-bodies --dry-run
 
 sudo -n docker run --rm --name cpa-body-migration \
   --network cpa-clickhouse_default --read-only --memory 768m --cpus 0.5 \
@@ -61,10 +82,10 @@ sudo -n docker run --rm --name cpa-body-migration \
   -e CLICKHOUSE_DB=cliproxy -e CLICKHOUSE_USER=cliproxy \
   -e CLICKHOUSE_PASSWORD_FILE=/run/secrets/ch_writer \
   -v /opt/cpa/clickhouse/secrets/ch_writer:/run/secrets/ch_writer:ro \
-  cpa-local/clickhouse-deriver:v0.1.0-plana.9 migrate-bodies
+  cpa-local/clickhouse-deriver:v0.1.0-plana.10 migrate-bodies
 ```
 
-The dry run writes nothing. The real run saves its candidate snapshot and verified cursor in the database. It writes blobs, writes guarded skeleton copies, checks every reconstructed SHA-256, synchronously deletes verified inline copies, then commits the cursor. Repeating the same command resumes unfinished work. A completed run takes a new snapshot on the next invocation.
+The dry run writes nothing. The real run saves its candidate snapshot and verified cursor in the database. It writes blobs, writes guarded skeleton copies, checks every reconstructed SHA-256, synchronously deletes verified inline copies, then commits the cursor. Repeating the same command resumes unfinished work. A completed run takes a new snapshot on the next invocation. Skipped rows are reported again on every invocation, including resume and no-op runs. Report migration totals cover the current invocation. Skips cover all currently oversized inline rows, including any without facts. A resume of an older snapshot also filters payload reads by the current limit.
 
 The memory admission check reserves 256 MiB of tracked headroom with its default 128 MiB query cap. RSS must stay below 1.375 GiB, and below the 2 GiB container limit minus the query cap. At RSS pressure the command purges unused jemalloc pages and waits five seconds before checking again. It never restarts ClickHouse. Sustained memory pressure pauses progress until the load subsides. Stop with SIGTERM if it remains stalled for ten minutes and inspect the live load.
 
@@ -87,7 +108,20 @@ Abort migration on any live-insert code 241, OOM kill, capture drop, repeated in
 
 ## Verify and roll back
 
-Sample `SELECT body_status FROM cliproxy.raw_request(id='...')`. Require `complete`, no new duplicate IDs, no missing blobs, and no new `body_incomplete` facts. Use the audits in `queries.sql`. Deleted inline bytes remain on disk until background merges reclaim them. Do not force a full-table `OPTIMIZE FINAL` during capture.
+Expect exactly the skipped rows to remain inline, rather than zero inline rows. Repeat the oversized-row manifest query above and compare every ID, timestamp, length, and SHA-256 with the saved pre-migration manifest and `requests_legacy_backup`. Require identical manifests, matching report count and byte totals, no skeleton for any skipped ID, and zero eligible inline rows. Run each comparison with `max_threads=1,max_block_size=1` and the 128 MiB cap. For example:
+
+```sql
+SELECT count() FROM cliproxy.requests
+WHERE length(request_body)>0 AND length(request_body)<=16777216
+SETTINGS max_threads=1,max_block_size=1,max_memory_usage=134217728;
+
+SELECT request_id,started_at,length(request_body) AS bytes,hex(SHA256(request_body)) AS sha256
+FROM cliproxy.requests_legacy_backup WHERE length(request_body)>16777216
+ORDER BY request_id,started_at
+SETTINGS max_threads=1,max_block_size=1,max_memory_usage=134217728;
+```
+
+Both manifest comparisons must pass before the backup can be retired. Sample `SELECT body_status FROM cliproxy.raw_request(id='...')`. Require `complete`, no new duplicate IDs, no missing blobs, and no new `body_incomplete` facts. Use the audits in `queries.sql`. Deleted inline bytes remain on disk until background merges reclaim them. Do not force a full-table `OPTIMIZE FINAL` during capture.
 
 Stopping migration is the immediate rollback. Readers support both formats, so completed batches need no reversal. Preserve the backup table until independent verification and an agreed retention period have passed.
 

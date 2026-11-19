@@ -77,7 +77,7 @@ func TestMigrationResumesDurableSnapshot(t *testing.T) {
 	}))
 	defer srv.Close()
 	d := newDeriver(newClickHouse(srv.URL, "", ""), "cliproxy", slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
-	cursor, err := d.migrationQueue(context.Background())
+	cursor, err := d.migrationQueue(context.Background(), nil)
 	if err != nil || cursor.ID != "verified" {
 		t.Fatal(cursor, err)
 	}
@@ -154,13 +154,20 @@ func TestMigrationRetriesCancelledDelete(t *testing.T) {
 	}
 }
 
-func TestMigrationSizePreflightRefusesBeforePayloadReads(t *testing.T) {
+func TestMigrationSizePreflightReportsSkipsWithoutPayloadReads(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
 		if strings.Contains(string(b), "system.asynchronous_metrics") {
 			fmt.Fprintln(w, `{"resident":500000000,"tracked":300000000,"limit":1610612736,"total":2147483648}`)
-		} else if strings.Contains(string(b), "max(length(request_body))") {
-			fmt.Fprintln(w, `{"max_body":16777217}`)
+		} else if strings.Contains(string(b), "SELECT request_id,length(request_body) AS bytes") {
+			if !strings.Contains(string(b), "max_threads=1,max_block_size=1") || r.URL.Query().Get("param_body_limit") != "16777216" {
+				t.Error("preflight must bound materialization and use the configured row limit")
+			}
+			fmt.Fprintln(w, `{"request_id":"large","bytes":16777217}`)
+		} else if strings.Contains(string(b), "SELECT DISTINCT request_id,started_at") {
+			if !strings.Contains(string(b), "PREWHERE request_id NOT IN") || r.URL.Query().Get("param_skipped_ids") != "['large']" {
+				t.Error("dry candidates must exclude oversized IDs before body reads")
+			}
 		} else {
 			t.Errorf("preflight read payloads or mutated state: %s", b)
 		}
@@ -169,8 +176,8 @@ func TestMigrationSizePreflightRefusesBeforePayloadReads(t *testing.T) {
 	ch := newClickHouse(srv.URL, "", "")
 	ch.memoryBytes = 128 << 20
 	d := newDeriver(ch, "cliproxy", slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
-	_, err := d.migrate(context.Background(), true)
-	if err == nil || !strings.Contains(err.Error(), "8 * max(length(request_body))") {
-		t.Fatal(err)
+	report, err := d.migrate(context.Background(), true)
+	if err != nil || report.Rows != 0 || report.SkippedRows != 1 || report.SkippedBytes != 16777217 || strings.Join(report.SkippedRequestIDs, ",") != "large" {
+		t.Fatal(report, err)
 	}
 }

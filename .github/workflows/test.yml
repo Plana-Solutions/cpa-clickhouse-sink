@@ -51,8 +51,8 @@ jobs:
         run: |
           cd deriver
           go vet ./...
-          go test -race -count=1 -timeout 10m -v -run 'TestMigrateNewSkeleton|TestRestoreKeepsSkeletonOnIncompleteBody' .
-          go test -race -count=1 -timeout 10m -v -skip 'TestMigrateNewSkeleton|TestRestoreKeepsSkeletonOnIncompleteBody' ./...
+          go test -race -count=1 -timeout 10m -v -run 'TestMigrateNewSkeleton|TestRestoreKeepsSkeletonOnIncompleteBody|TestMigrationSkipsOversized' .
+          go test -race -count=1 -timeout 10m -v -skip 'TestMigrateNewSkeleton|TestRestoreKeepsSkeletonOnIncompleteBody|TestMigrationSkipsOversized' ./...
       - name: Remove the additional server and its volumes
         if: always()
         run: docker rm -fv deriver-${{ github.run_id }}

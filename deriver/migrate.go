@@ -13,10 +13,13 @@ import (
 )
 
 type migrationReport struct {
-	Rows           int    `json:"rows"`
-	InlineBytes    uint64 `json:"inline_bytes"`
-	ProjectedBytes uint64 `json:"projected_uncompressed_bytes"`
-	DryRun         bool   `json:"dry_run"`
+	Rows              int      `json:"rows"`
+	InlineBytes       uint64   `json:"inline_bytes"`
+	ProjectedBytes    uint64   `json:"projected_uncompressed_bytes"`
+	DryRun            bool     `json:"dry_run"`
+	SkippedRows       int      `json:"skipped_rows"`
+	SkippedBytes      uint64   `json:"skipped_bytes"`
+	SkippedRequestIDs []string `json:"skipped_request_ids"`
 }
 
 type migrationBody struct {
@@ -27,32 +30,37 @@ type migrationBody struct {
 }
 
 func (d *deriver) migrate(ctx context.Context, dry bool) (migrationReport, error) {
-	report := migrationReport{DryRun: dry}
+	report := migrationReport{DryRun: dry, SkippedRequestIDs: []string{}}
 	if err := d.migrationMemory(ctx); err != nil {
 		return report, err
 	}
-	sizes, err := migrationRows[struct {
-		Max uint64 `json:"max_body"`
-	}](ctx, d.ch,
-		"SELECT max(length(request_body)) AS max_body FROM "+d.db+".requests SETTINGS max_threads=1,max_execution_time=300", nil)
+	// Reserve eight times each inline body for encoding and full-row copies.
+	limit := map[string]string{"body_limit": fmt.Sprint(d.ch.memoryBytes / 8)}
+	skipped, err := migrationRows[struct {
+		ID    string `json:"request_id"`
+		Bytes uint64 `json:"bytes"`
+	}](ctx, d.ch, "SELECT request_id,length(request_body) AS bytes FROM "+d.db+".requests WHERE length(request_body)>{body_limit:UInt64} ORDER BY request_id SETTINGS max_threads=1,max_block_size=1,max_execution_time=300", limit)
 	if err != nil {
 		return report, fmt.Errorf("migration size preflight: %w", err)
 	}
-	// Reserve eight times the largest inline body for encoding and full-row copies.
-	if len(sizes) != 1 || sizes[0].Max > uint64(d.ch.memoryBytes)/8 {
-		return report, fmt.Errorf("migration requires query-memory-bytes >= 8 * max(length(request_body)); increase the cap and recheck server headroom")
+	for _, r := range skipped {
+		report.SkippedRows++
+		report.SkippedBytes += r.Bytes
+		report.SkippedRequestIDs = append(report.SkippedRequestIDs, r.ID)
+		d.log.Info("migration skipping oversized inline body", "request_id", r.ID, "bytes", r.Bytes)
 	}
+	limit["skipped_ids"] = chArray(report.SkippedRequestIDs)
 	cursor := migrationCursor{migrationCandidate: migrationCandidate{TS: epoch}}
 	var dryCandidates []migrationCandidate
 	if dry {
 		var err error
-		dryCandidates, err = migrationRows[migrationCandidate](ctx, d.ch, "SELECT DISTINCT request_id,started_at FROM "+d.db+`.requests WHERE length(request_body)>0 AND request_id IN (SELECT request_id FROM `+d.db+`.request_facts) ORDER BY started_at,request_id SETTINGS max_threads=1,max_block_size=1,preferred_block_size_bytes=1048576`, nil)
+		dryCandidates, err = migrationRows[migrationCandidate](ctx, d.ch, "SELECT DISTINCT request_id,started_at FROM "+d.db+`.requests PREWHERE request_id NOT IN {skipped_ids:Array(String)} WHERE length(request_body)>0 AND length(request_body)<={body_limit:UInt64} AND request_id IN (SELECT request_id FROM `+d.db+`.request_facts) ORDER BY started_at,request_id SETTINGS max_threads=1,max_block_size=1,preferred_block_size_bytes=1048576`, limit)
 		if err != nil {
 			return report, err
 		}
 	} else {
 		var err error
-		cursor, err = d.migrationQueue(ctx)
+		cursor, err = d.migrationQueue(ctx, report.SkippedRequestIDs)
 		if err != nil {
 			return report, err
 		}
@@ -80,7 +88,7 @@ func (d *deriver) migrate(ctx context.Context, dry bool) (migrationReport, error
 		var batch []migrationBody
 		size := 0
 		for _, c := range candidates {
-			rows, err := migrationRows[migrationBody](ctx, d.ch, `SELECT request_id,started_at,base64Encode(request_body) AS body,request_headers,hex(SHA256(request_body)) AS sha FROM `+d.db+`.requests PREWHERE request_id={id:String} AND started_at={ts:DateTime64(9,'UTC')} WHERE length(request_body)>0 LIMIT 1 SETTINGS max_threads=1,max_block_size=1,preferred_block_size_bytes=1048576`, map[string]string{"id": c.ID, "ts": c.TS})
+			rows, err := migrationRows[migrationBody](ctx, d.ch, `SELECT request_id,started_at,base64Encode(request_body) AS body,request_headers,hex(SHA256(request_body)) AS sha FROM `+d.db+`.requests PREWHERE request_id={id:String} AND started_at={ts:DateTime64(9,'UTC')} WHERE length(request_body)>0 AND length(request_body)<={body_limit:UInt64} LIMIT 1 SETTINGS max_threads=1,max_block_size=1,preferred_block_size_bytes=1048576`, map[string]string{"id": c.ID, "ts": c.TS, "body_limit": limit["body_limit"]})
 			if err != nil {
 				return report, fmt.Errorf("read migration request %s: %w", c.ID, err)
 			}
@@ -196,20 +204,20 @@ func (d *deriver) migrateBatch(ctx context.Context, rows []migrationBody, dry bo
 				return err
 			}
 		}
-		p := map[string]string{"ids": chArray(ids)}
+		p := map[string]string{"ids": chArray(ids), "body_limit": fmt.Sprint(d.ch.memoryBytes / 8)}
 		q := `INSERT INTO ` + d.db + `.requests SELECT req.* EXCEPT(duration_ms) REPLACE (
  '' AS request_body,sk.lineage AS lineage,sk.body_len AS body_len,sk.body_sha256 AS body_sha256,
  sk.body_residual AS body_residual,sk.body_ref_offsets AS body_ref_offsets,sk.body_refs AS body_refs)
  FROM (SELECT * FROM ` + d.db + `.requests PREWHERE request_id IN {ids:Array(String)}
- WHERE length(request_body)>0 AND request_id NOT IN (SELECT request_id FROM ` + d.db + `.requests PREWHERE request_id IN {ids:Array(String)} WHERE body_sha256!=repeat(char(0),32))) req
- INNER JOIN skeleton sk ON req.request_id=sk.request_id AND req.started_at=sk.started_at LIMIT 1 BY req.request_id`
+ WHERE length(request_body)>0 AND length(request_body)<={body_limit:UInt64} AND request_id NOT IN (SELECT request_id FROM ` + d.db + `.requests PREWHERE request_id IN {ids:Array(String)} WHERE body_sha256!=repeat(char(0),32))) req
+ INNER JOIN skeleton sk ON req.request_id=sk.request_id AND req.started_at=sk.started_at LIMIT 1 BY req.request_id SETTINGS max_threads=1,max_block_size=1`
 		if err := d.ch.external(ctx, q, p, candidateStructure+bodystore.SkeletonStructure, skeletons); err != nil {
 			return err
 		}
 		if err := d.verifyMigrationBatch(ctx, ids, digests, false); err != nil {
 			return err
 		}
-		if err := d.ch.exec(ctx, "DELETE FROM "+d.db+".requests WHERE request_id IN {ids:Array(String)} AND body_sha256=repeat(char(0),32) SETTINGS lightweight_deletes_sync=1,max_execution_time=300", p); err != nil {
+		if err := d.ch.exec(ctx, "DELETE FROM "+d.db+".requests WHERE request_id IN {ids:Array(String)} AND body_sha256=repeat(char(0),32) AND length(request_body)<={body_limit:UInt64} SETTINGS max_threads=1,max_block_size=1,lightweight_deletes_sync=1,max_execution_time=300", p); err != nil {
 			return err
 		}
 	}
@@ -232,7 +240,7 @@ func (d *deriver) verifyMigrationBatch(ctx context.Context, ids []string, want m
 	rows, err := migrationRows[struct {
 		ID  string `json:"request_id"`
 		SHA string `json:"sha"`
-	}](ctx, d.ch, "SELECT request_id,"+hash+" AS sha FROM "+d.db+".requests PREWHERE request_id IN {ids:Array(String)} WHERE "+filter+" LIMIT 1 BY request_id", map[string]string{"ids": chArray(ids)})
+	}](ctx, d.ch, "SELECT request_id,"+hash+" AS sha FROM "+d.db+".requests PREWHERE request_id IN {ids:Array(String)} WHERE "+filter+" LIMIT 1 BY request_id SETTINGS max_threads=1,max_block_size=1", map[string]string{"ids": chArray(ids)})
 	if err != nil {
 		return fmt.Errorf("verify migration batch: %w", err)
 	}
