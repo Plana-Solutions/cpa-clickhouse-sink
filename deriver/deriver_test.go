@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -500,7 +501,7 @@ func TestFetchIncompleteSkeletonFallsBackInline(t *testing.T) {
 	d := testDeriver(t)
 	r := fixtureRow(t, "chat_stream", "fallback", time.Now())
 	insertRaw(t, d, r)
-	if err := d.ch.exec(context.Background(), `INSERT INTO `+testDB+`.requests SELECT * EXCEPT(duration_ms) REPLACE('' AS request_body,2 AS body_len,SHA256('{}') AS body_sha256,[repeat('x',16)] AS body_refs,[toUInt32(0)] AS body_ref_offsets) FROM `+testDB+`.requests WHERE request_id='fallback'`, nil); err != nil {
+	if err := d.ch.exec(context.Background(), `INSERT INTO `+testDB+`.requests SELECT * EXCEPT(duration_ms) REPLACE('' AS request_body,length(req.request_body) AS body_len,SHA256(req.request_body) AS body_sha256,[repeat('x',16)] AS body_refs,[toUInt32(0)] AS body_ref_offsets) FROM `+testDB+`.requests AS req WHERE request_id='fallback'`, nil); err != nil {
 		t.Fatal(err)
 	}
 	called := false
@@ -513,5 +514,22 @@ func TestFetchIncompleteSkeletonFallsBackInline(t *testing.T) {
 	})
 	if err != nil || !called {
 		t.Fatal(err, called)
+	}
+}
+
+func TestMigrationVerificationRejectsInlineFallback(t *testing.T) {
+	d := testDeriver(t)
+	r := fixtureRow(t, "chat_stream", "missing-blob", time.Now())
+	insertRaw(t, d, r)
+	err := d.ch.exec(context.Background(), `INSERT INTO `+testDB+`.requests SELECT * EXCEPT(duration_ms) REPLACE('' AS request_body,length(req.request_body) AS body_len,SHA256(req.request_body) AS body_sha256,[repeat('x',16)] AS body_refs,[toUInt32(0)] AS body_ref_offsets) FROM `+testDB+`.requests AS req WHERE request_id='missing-blob'`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][32]byte{"missing-blob": sha256.Sum256([]byte(r.RequestBody))}
+	if err := d.verifyMigrationBatch(context.Background(), []string{"missing-blob"}, want, false); !errors.Is(err, bodystore.ErrIncomplete) {
+		t.Fatalf("migration accepted a missing blob while an inline copy was present: %v", err)
+	}
+	if got := scalar(t, d, "SELECT countIf(length(request_body)>0) FROM "+testDB+".requests"); got != "1" {
+		t.Fatal("inline recovery source changed", got)
 	}
 }
