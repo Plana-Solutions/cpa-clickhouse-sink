@@ -264,7 +264,7 @@ func (s *sink) flushBodies(cfg sinkConfig) error {
 				r.sk = bodystore.Skeleton{}
 				rows = append(rows, encodeBodyRequest(r))
 			}
-			u.rows = binaryBatch("requests", bodyRequestColumns, rows)
+			u.rows = bodyRows(u.requests, rows)
 		}
 		if u.rows == nil {
 			if u.blobs == nil {
@@ -290,7 +290,7 @@ func (s *sink) flushBodies(cfg sinkConfig) error {
 				}
 				rows = append(rows, encodeBodyRequest(r))
 			}
-			u.rows = binaryBatch("requests", bodyRequestColumns, rows)
+			u.rows = bodyRows(u.requests, rows)
 			u.blobs = nil
 			u.keys = nil
 		}

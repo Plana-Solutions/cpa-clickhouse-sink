@@ -1,6 +1,6 @@
 # Store each repeated request item once
 
-`body-dedup: true` stores redacted protocol items in `body_blobs` and a byte skeleton in `requests`. The default is **false** in v0.1.0-plana.6. Responses stay inline. The plugin redacts the complete row before it computes a lineage or a hash.
+`body-dedup: true` stores redacted protocol items in `body_blobs` and a byte skeleton in `requests`. The default is **false** in v0.1.0-plana.7. Responses stay inline. The plugin redacts the complete row before it computes a lineage or a hash.
 
 `bodystore.Split` extracts messages, Responses input items, Gemini contents, tools, and system or instruction values. Invalid input falls back to a whole-body item. It never reserializes JSON. Every reconstruction checks each item's truncated SHA-256 and the request's full SHA-256. Missing or corrupt content returns `body incomplete`. The SQL view returns an empty body and `body_status = 'incomplete'`.
 
@@ -8,7 +8,7 @@ The wire format for new plugin rows is RowBinary. JSON strings cannot preserve a
 
 ## Roll out without changing existing rows
 
-1. Deploy `clickhouse-deriver-linux-arm64` from v0.1.0-plana.6. Keep the existing password-file mount and existing resource settings. Its startup adds columns with `ADD COLUMN IF NOT EXISTS`, creates `body_blobs` and `raw_request`, and keeps reading legacy rows. It retains 16-row, 8 MiB batches, 512 rows per pass, a 256 MiB query limit, and the fresh/backlog split.
+1. Deploy `clickhouse-deriver-linux-arm64` from v0.1.0-plana.7. Keep the existing password-file mount and existing resource settings. Its startup adds columns with `ADD COLUMN IF NOT EXISTS`, creates `body_blobs` and `raw_request`, and keeps reading legacy rows. It retains 16-row, 8 MiB batches, 512 rows per pass, a 256 MiB query limit, and the fresh/backlog split.
 2. Deploy every UI and export reader with `bodystore.Reader` before enabling dedup. This repository does not deploy the archive UI. Old readers see an empty request body for dedup rows.
 3. Install the plugin from the same release. Enable the following setting in the existing plugin config. Keep the existing URL, database, username, password injection, and redaction settings.
 
@@ -37,7 +37,7 @@ Only nonempty inline rows whose request ID already has facts qualify. Bodies are
 
 ## Retry and retention rules
 
-The plugin buffers skeletons and owned item bytes, never the original full request body. It inserts blobs before their requests. A transient blob failure blocks later units. A request failure retries the unchanged request batch without reinserting its successful blob batch. A destination or credential change re-prepares the whole retained unit against the current config, including its blobs. Setting `body-dedup: false` reconstructs queued units inline and drains them without a CPA restart. Usage and legacy batches flush before body retries and continue when a body unit fails. Reconfigure never takes the flush lock, with either flag value. The hash cache is scoped to the destination, and failed body writes invalidate schema state before retry. HTTP 400 bisection of blobs converts affected requests back to inline storage.
+The plugin buffers skeletons and owned item bytes, never the original full request body. It inserts blobs before their requests. A transient blob failure blocks later units. A request failure retries the unchanged request batch without reinserting its successful blob batch. Request inserts exclude existing primary keys in the batch timestamp range, including after a lost acknowledgement. Block deduplication stays disabled so repaired data can be reinserted. A destination or credential change re-prepares the whole retained unit against the current config, including its blobs. Setting `body-dedup: false` reconstructs queued units inline and drains them without a CPA restart. Usage and legacy batches flush before body retries and continue when a body unit fails. Reconfigure never takes the flush lock, with either flag value. The hash cache is scoped to the destination, and failed body writes invalidate schema state before retry. HTTP 400 bisection of blobs converts affected requests back to inline storage.
 
 The acknowledged-hash cache holds at most 512 lineages and 100,000 hashes per lineage, with a 16 MiB accounting cap charging 64 bytes per hash and 256 bytes per lineage. A preload has a 1.5 second deadline inside a three second budget shared by the flush. Failed preloads are never cached. Entries expire after 24 hours idle. First sight loads committed hashes with a lineage range query. Lineage zero is never preloaded. A failed preload resends identical items. Duplicate items from concurrent writers are harmless; readers choose one copy per key.
 

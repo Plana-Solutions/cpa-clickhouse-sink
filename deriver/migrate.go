@@ -111,6 +111,7 @@ func (d *deriver) migrate(ctx context.Context, dry bool) (migrationReport, error
 }
 
 func (d *deriver) migrateBatch(ctx context.Context, rows []migrationBody, dry bool, dryKeys map[bodystore.Key]bool, report *migrationReport) error {
+	newDryKeys := map[bodystore.Key]bool{}
 	var blobs, skeletons []byte
 	ids := []string{}
 	digests := map[string][32]byte{}
@@ -151,12 +152,12 @@ func (d *deriver) migrateBatch(ctx context.Context, rows []migrationBody, dry bo
 				continue
 			}
 			keys[k] = true
-			projected += uint64(len(data) + 40)
+			projected += uint64(len(data) + 48)
 			if dry {
-				if len(dryKeys) >= 1000000 {
+				if len(dryKeys)+len(newDryKeys) >= 1000000 {
 					return fmt.Errorf("dry-run exceeds the one-million-key memory limit")
 				}
-				dryKeys[k] = true
+				newDryKeys[k] = true
 			} else {
 				blobs = append(blobs, bodystore.EncodeBlob(lineage, h, data, ts)...)
 			}
@@ -169,7 +170,8 @@ func (d *deriver) migrateBatch(ctx context.Context, rows []migrationBody, dry bo
 		ids = append(ids, r.ID)
 		digests[r.ID] = digest
 		inline += uint64(len(r.Body))
-		projected += uint64(len(sk.Residual) + len(sk.Refs)*20 + 36)
+		// Eight bytes per length prefix also cover MergeTree array size streams.
+		projected += uint64(len(sk.Residual) + len(sk.Offsets)*4 + len(sk.Refs)*16 + 68)
 	}
 	if !dry && len(ids) > 0 {
 		if len(blobs) > 0 {
@@ -199,6 +201,9 @@ func (d *deriver) migrateBatch(ctx context.Context, rows []migrationBody, dry bo
 		if err := d.ch.exec(ctx, "DELETE FROM "+d.db+".requests WHERE request_id IN {ids:Array(String)} AND body_sha256=repeat(char(0),32) SETTINGS lightweight_deletes_sync=1", p); err != nil {
 			return err
 		}
+	}
+	for k := range newDryKeys {
+		dryKeys[k] = true
 	}
 	report.Rows += len(rows)
 	report.InlineBytes += inline

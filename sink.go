@@ -55,12 +55,13 @@ func (c sinkConfig) equal(o sinkConfig) bool {
 
 // Legacy and usage batches keep stable tokens across retries. Body batches allow re-inserts after repair.
 type batch struct {
-	format  string
-	columns string
-	table   string
-	rows    [][]byte
-	token   string
-	size    int
+	first, last string
+	format      string
+	columns     string
+	table       string
+	rows        [][]byte
+	token       string
+	size        int
 }
 
 func newBatch(table string, rows [][]byte) batch {
@@ -252,6 +253,7 @@ func (s *sink) insertBatch(cfg sinkConfig, b batch) error {
 		part := newBatch(b.table, half)
 		part.format = b.format
 		part.columns = b.columns
+		part.first, part.last = b.first, b.last
 		if errPart := s.insertBatch(cfg, part); errPart != nil {
 			return errPart
 		}
@@ -320,6 +322,12 @@ func (s *sink) insert(cfg sinkConfig, b batch) error {
 	}
 	if b.format == "RowBinary" {
 		params.Set("insert_deduplicate", "0")
+		if b.table == tableRequests {
+			params.Set("query", fmt.Sprintf("INSERT INTO %s SELECT * FROM input({row_schema:String}) WHERE (started_at,request_id) NOT IN (SELECT started_at,request_id FROM %s.requests PREWHERE started_at>={first:DateTime64(9,'UTC')} AND started_at<={last:DateTime64(9,'UTC')}) LIMIT 1 BY started_at,request_id FORMAT RowBinary", table, cfg.Database))
+			params.Set("param_row_schema", bodyRequestStructure)
+			params.Set("param_first", b.first)
+			params.Set("param_last", b.last)
+		}
 	}
 	sep := []byte{'\n'}
 	if b.format == "RowBinary" {

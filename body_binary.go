@@ -44,6 +44,21 @@ func (w *binaryRow) ts(v string) {
 
 const bodyRequestColumns = `request_id,trace_id,started_at,completed_at,path,source_format,model,requested_model,stream,outcome,status_code,error,request_headers,request_body,response_headers,response_body,response_chunks,redaction_count,redaction_rules,lineage,body_len,body_sha256,body_residual,body_ref_offsets,body_refs`
 
+const bodyRequestStructure = "request_id String,trace_id String,started_at DateTime64(9,'UTC'),completed_at DateTime64(9,'UTC'),path String,source_format String,model String,requested_model String,stream Bool,outcome String,status_code UInt16,error String,request_headers Map(String,String),request_body String,response_headers Map(String,String),response_body String,response_chunks Array(String),redaction_count Int32,redaction_rules Array(String)," + bodystore.SkeletonStructure
+
+func bodyRows(requests []bodyRequest, rows [][]byte) *batch {
+	b := binaryBatch("requests", bodyRequestColumns, rows)
+	for _, r := range requests {
+		if b.first == "" || r.row.StartedAt < b.first {
+			b.first = r.row.StartedAt
+		}
+		if b.last == "" || r.row.StartedAt > b.last {
+			b.last = r.row.StartedAt
+		}
+	}
+	return b
+}
+
 func encodeBodyRequest(r bodyRequest) []byte {
 	w := new(binaryRow)
 	w.s(r.row.RequestID)

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"log/slog"
@@ -9,6 +11,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/Plana-Solutions/cpa-clickhouse-sink/bodystore"
+	"time"
 )
 
 func TestMigrationMemoryThresholds(t *testing.T) {
@@ -62,5 +67,42 @@ func TestMigrationRetriesMemoryExceptionWithoutPartialRows(t *testing.T) {
 	rows, err := migrationRows[migrationCandidate](context.Background(), newClickHouse(srv.URL, "", ""), "SELECT request_id", nil)
 	if err != nil || calls != 2 || len(rows) != 1 || rows[0].ID != "complete" {
 		t.Fatal(rows, calls, err)
+	}
+}
+
+func TestDryRunCommitsKeysOnlyAfterSuccess(t *testing.T) {
+	fail := true
+	lookups := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lookups++
+		if fail && lookups == 2 {
+			w.WriteHeader(400)
+		}
+	}))
+	defer srv.Close()
+	d := newDeriver(newClickHouse(srv.URL, "", ""), "cliproxy", slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	var rows []migrationBody
+	minimum := uint64(0)
+	for i, body := range []string{`{"messages":["one"]}`, `{"messages":["two"]}`} {
+		raw := []byte(body)
+		sha := sha256.Sum256(raw)
+		rows = append(rows, migrationBody{migrationCandidate: migrationCandidate{ID: fmt.Sprint(i), TS: "2026-01-01 00:00:00.000000000"}, Body: raw, SHA: hex.EncodeToString(sha[:])})
+		sk, items := bodystore.Split(raw)
+		minimum += uint64(len(bodystore.EncodeSkeleton(0, sk)))
+		for h, data := range items {
+			minimum += uint64(len(bodystore.EncodeBlob(0, h, data, time.Now())) + 8)
+		}
+	}
+	keys := map[bodystore.Key]bool{}
+	report := migrationReport{DryRun: true}
+	if err := d.migrateBatch(context.Background(), rows, true, keys, &report); err == nil || len(keys) != 0 || report.Rows != 0 {
+		t.Fatal("failed dry run changed accounting", err, report, len(keys))
+	}
+	fail = false
+	if err := d.migrateBatch(context.Background(), rows, true, keys, &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Rows != 2 || report.ProjectedBytes < minimum {
+		t.Fatal("dry run underestimates serialized body storage", report, minimum)
 	}
 }
