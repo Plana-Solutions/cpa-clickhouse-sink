@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -52,14 +53,34 @@ func TestLargeBodyLiveLoad(t *testing.T) {
 	s.start()
 	count := 0
 	start := time.Now()
+	bodyFor := func(i int) string {
+		return strings.TrimSuffix(seed.Body, "]}") + fmt.Sprintf(", {\"role\":\"user\",\"content\":\"live turn %d %d\"}]}", start.Unix(), i)
+	}
 	for time.Since(start) < time.Duration(seconds)*time.Second {
 		ts := formatTime(time.Now())
-		body := strings.TrimSuffix(seed.Body, "]}") + fmt.Sprintf(", {\"role\":\"user\",\"content\":\"live turn %d\"}]}", count)
+		body := bodyFor(count)
 		s.addRequest(requestRow{RequestID: fmt.Sprintf("live-%d-%d", start.Unix(), count), StartedAt: ts, CompletedAt: ts, SourceFormat: "claude", Model: "synthetic", Path: "/v1/messages", Outcome: "succeeded", StatusCode: 200, RequestHeaders: map[string]string{"session-id": "live-test"}, RequestBody: body})
 		count++
 		time.Sleep(time.Second)
 	}
 	s.stop()
+	for _, i := range []int{0, count - 1} {
+		id := fmt.Sprintf("live-%d-%d", start.Unix(), i)
+		response, err := http.Post(endpoint, "text/plain", strings.NewReader("SELECT hex(SHA256(request_body)) sha,body_status FROM cliproxy.raw_request(id='"+id+"') FORMAT JSONEachRow"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var row struct {
+			SHA    string `json:"sha"`
+			Status string `json:"body_status"`
+		}
+		err = json.NewDecoder(response.Body).Decode(&row)
+		response.Body.Close()
+		if err != nil || row.Status != "complete" || !strings.EqualFold(row.SHA, fmt.Sprintf("%x", sha256.Sum256([]byte(bodyFor(i))))) {
+			t.Fatal("live body mismatch", id, err)
+		}
+	}
+
 	t.Logf("live rows=%d insert_errors=%d code241=%d buffered=%d dropped=%d seconds=%.1f", count, failures.Load(), code241.Load(), s.buffered, s.dropped, time.Since(start).Seconds())
 	if failures.Load() != 0 || s.buffered != 0 || s.dropped != 0 {
 		t.Fatal("live capture failed")
