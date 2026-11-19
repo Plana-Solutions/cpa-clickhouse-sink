@@ -60,15 +60,18 @@ func TestViewManyReferences(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		id           string
-		n, size, cap int
-	}{{"many", 385, 8500, 64 << 20}, {"large", 72, 218400, 128 << 20}} {
+		id                     string
+		n, size, cap, residual int
+	}{{"many", 385, 8500, 64 << 20, 0}, {"large", 72, 218400, 128 << 20, 0}, {"residual", 385, 4000, 64 << 20, 1 << 20}} {
 		t.Run(tc.id, func(t *testing.T) {
 			items := make([]string, tc.n)
 			for i := range items {
 				items[i] = fmt.Sprintf(`{"role":"user","content":"%d%s"}`, i, strings.Repeat("x", tc.size))
 			}
 			body := `{"messages":[` + strings.Join(items, ",") + `]}`
+			if tc.residual > 0 {
+				body = `{"extra":"` + strings.Repeat("r", tc.residual) + `",` + body[1:]
+			}
 			want := sha256.Sum256([]byte(body))
 			ts := formatTime(time.Now())
 			s.addRequest(requestRow{RequestID: tc.id, StartedAt: ts, CompletedAt: ts, RequestHeaders: map[string]string{"session-id": tc.id}, RequestBody: body})

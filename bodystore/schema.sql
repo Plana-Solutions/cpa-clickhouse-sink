@@ -31,13 +31,13 @@ WITH
    LIMIT 1 BY lineage,hash),
  fragments AS (
    SELECT ordinal, concat(
-     substring(body_residual, if(ordinal<=1,1,body_ref_offsets[ordinal-1]+1),
+     substring((SELECT body_residual FROM r), if(ordinal<=1,1,body_ref_offsets[ordinal-1]+1),
        greatest(toInt64(body_ref_offsets[ordinal])-if(ordinal<=1,0,body_ref_offsets[ordinal-1]),0)),
      b.data) AS fragment,
-     (ordinal=0 OR (b.valid AND body_ref_offsets[ordinal]<=length(body_residual)
+     (ordinal=0 OR (b.valid AND body_ref_offsets[ordinal]<=length((SELECT body_residual FROM r))
        AND (ordinal=1 OR body_ref_offsets[ordinal]>=body_ref_offsets[ordinal-1]))) AS valid
-   FROM r LEFT ARRAY JOIN body_refs AS ref, arrayEnumerate(body_refs) AS ordinal
-   LEFT JOIN b ON r.lineage=b.lineage AND ref=b.hash),
+   FROM (SELECT lineage,body_refs,body_ref_offsets FROM r) AS refs LEFT ARRAY JOIN body_refs AS ref, arrayEnumerate(body_refs) AS ordinal
+   LEFT JOIN b ON refs.lineage=b.lineage AND ref=b.hash),
  assembled AS (SELECT arrayStringConcat(groupArray(fragment)) AS prefix,
    min(valid) AS valid FROM (SELECT fragment,valid FROM fragments ORDER BY ordinal)),
  checked AS (SELECT r.request_id,
