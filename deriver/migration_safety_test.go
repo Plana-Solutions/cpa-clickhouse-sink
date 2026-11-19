@@ -16,21 +16,45 @@ import (
 	"time"
 )
 
-func TestMigrationMemoryThresholds(t *testing.T) {
-	for _, resident := range []int{59, 60, 74, 75} {
-		t.Run(fmt.Sprint(resident), func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				fmt.Fprintf(w, `{"resident":%d,"limit":100}`, resident)
-			}))
-			defer srv.Close()
-			d := newDeriver(newClickHouse(srv.URL, "", ""), "cliproxy", slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
-			for _, threshold := range []float64{.60, .75} {
-				err := d.migrationMemory(context.Background(), threshold)
-				if (err != nil) != (float64(resident) >= threshold*100) {
-					t.Fatalf("resident=%d threshold=%f err=%v", resident, threshold, err)
-				}
+func TestMigrationMemoryHeadroom(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		tracked, resident float64
+		want              bool
+	}{
+		{"normal RSS above old admission", 600 << 20, 1100 << 20, true},
+		{"reserve live inserts", 1200 << 20, 1300 << 20, false},
+		{"reserve container headroom", 600 << 20, 1850 << 20, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := migrationMemory{Tracked: tc.tracked, Resident: tc.resident, Limit: 1536 << 20, Total: 2048 << 20}
+			if m.available(256<<20) != tc.want {
+				t.Fatal(m)
 			}
 		})
+	}
+}
+
+func TestMigrationMemoryWaitCancelsAndMissingGrantsRefuse(t *testing.T) {
+	for _, denied := range []bool{false, true} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if denied {
+				w.WriteHeader(403)
+				return
+			}
+			fmt.Fprintln(w, `{"resident":1900000000,"tracked":1300000000,"limit":1610612736,"total":2147483648}`)
+		}))
+		d := newDeriver(newClickHouse(srv.URL, "", ""), "cliproxy", slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		err := d.migrationMemory(ctx)
+		cancel()
+		srv.Close()
+		if err == nil {
+			t.Fatal("unsafe admission")
+		}
+		if denied && !strings.Contains(err.Error(), "requires SELECT") {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -104,5 +128,21 @@ func TestDryRunCommitsKeysOnlyAfterSuccess(t *testing.T) {
 	}
 	if report.Rows != 2 || report.ProjectedBytes < minimum {
 		t.Fatal("dry run underestimates serialized body storage", report, minimum)
+	}
+}
+
+func TestMigrationRetriesCancelledDelete(t *testing.T) {
+	for _, code := range []int{394, 159} {
+		calls := 0
+		err := migrationRetry(context.Background(), func() error {
+			calls++
+			if calls == 1 {
+				return &chError{status: 500, msg: fmt.Sprintf("Code: %d. pending delete", code)}
+			}
+			return nil
+		})
+		if err != nil || calls != 2 {
+			t.Fatal(code, calls, err)
+		}
 	}
 }

@@ -333,3 +333,40 @@ func TestFlagOffDrainsQueuedBodies(t *testing.T) {
 		t.Fatalf("flag-off drain failed buffered=%d blobs=%d", s.buffered, blobs)
 	}
 }
+
+func TestOutageBacklogInsertCaps(t *testing.T) {
+	for _, dedup := range []bool{false, true} {
+		t.Run(fmt.Sprint(dedup), func(t *testing.T) {
+			outage := true
+			inserts := 0
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				data, _ := io.ReadAll(r.Body)
+				if !strings.HasPrefix(r.URL.Query().Get("query"), "INSERT") {
+					return
+				}
+				if outage {
+					w.WriteHeader(503)
+					return
+				}
+				inserts++
+				if len(data) > flushBytes {
+					t.Errorf("unbounded insert: %d", len(data))
+				}
+			}))
+			defer server.Close()
+			s := newSink(sinkConfig{URL: server.URL, Database: "test", BodyDedup: dedup})
+			s.schemaOK = true
+			for i := 0; i < 40; i++ {
+				s.addRequest(requestRow{RequestID: fmt.Sprint(i), StartedAt: formatTime(time.Now()), CompletedAt: formatTime(time.Now()), RequestBody: strings.Repeat("x", 1<<20)})
+				if i == 0 {
+					s.flushNow()
+				}
+			}
+			outage = false
+			s.flushNow()
+			if s.buffered != 0 || s.bodyRetry != nil || inserts < 6 {
+				t.Fatal("backlog not drained in bounded inserts", s.buffered, inserts)
+			}
+		})
+	}
+}

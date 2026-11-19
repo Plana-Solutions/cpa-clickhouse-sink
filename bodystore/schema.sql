@@ -25,9 +25,9 @@ COMMENT 'Deduplicated request-body items. Reconstruct with raw_request(id) or by
 ;
 CREATE OR REPLACE VIEW {db}.raw_request AS
 WITH
- r AS (SELECT * FROM {db}.requests WHERE request_id = {id:String} ORDER BY request_body = '' DESC LIMIT 1),
+ r AS (SELECT * FROM {db}.requests PREWHERE request_id = {id:String} ORDER BY body_sha256 = repeat(char(0),32) LIMIT 1),
  b AS (SELECT groupArray(hash) AS hashes, groupArray(data) AS pieces FROM (
-   SELECT hash, data FROM {db}.body_blobs WHERE (lineage, hash) IN (SELECT lineage, arrayJoin(body_refs) FROM r) LIMIT 1 BY lineage, hash)),
+   SELECT hash, data FROM {db}.body_blobs PREWHERE (lineage, hash) IN (SELECT lineage, arrayJoin(body_refs) FROM r) LIMIT 1 BY lineage, hash)),
  joined AS (SELECT r.*, b.*,
    concat(arrayStringConcat(arrayMap(k -> concat(
      substring(body_residual, if(k=1,1,body_ref_offsets[k-1]+1),
@@ -44,4 +44,5 @@ WITH
      AND arrayAll(h -> indexOf(hashes,h)>0 AND substring(SHA256(pieces[indexOf(hashes,h)]),1,16)=h, body_refs))) AS complete
    FROM joined)
 SELECT request_id, if(complete,candidate,'') AS request_body, if(complete,'complete','incomplete') AS body_status FROM checked
+SETTINGS max_threads=1, max_block_size=1, preferred_block_size_bytes=1048576
 ;

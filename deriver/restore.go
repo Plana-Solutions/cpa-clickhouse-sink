@@ -11,7 +11,7 @@ import (
 // A verified inline batch precedes deletion. Remaining skeletons are the checkpoint.
 func (d *deriver) restoreBodies(ctx context.Context, dry bool) (migrationReport, error) {
 	report := migrationReport{DryRun: dry}
-	if err := d.migrationMemory(ctx, 0.60); err != nil {
+	if err := d.migrationMemory(ctx); err != nil {
 		return report, err
 	}
 	rows, err := migrationRows[candidate](ctx, d.ch, "SELECT request_id,body_len AS bytes FROM "+d.db+".requests WHERE body_sha256!=repeat(char(0),32) ORDER BY started_at,request_id LIMIT 1 BY request_id", nil)
@@ -24,7 +24,7 @@ func (d *deriver) restoreBodies(ctx context.Context, dry bool) (migrationReport,
 		for i, r := range batch {
 			ids[i] = r.RequestID
 		}
-		if err := d.migrationMemory(ctx, 0.75); err != nil {
+		if err := d.migrationMemory(ctx); err != nil {
 			return report, err
 		}
 		err := migrationRetry(ctx, func() error {
@@ -61,7 +61,7 @@ func (d *deriver) restoreBodies(ctx context.Context, dry bool) (migrationReport,
 				if err := d.verifyMigrationBatch(ctx, ids, digests, true); err != nil {
 					return err
 				}
-				if err := d.ch.exec(ctx, "DELETE FROM "+d.db+".requests WHERE request_id IN {ids:Array(String)} AND body_sha256!=repeat(char(0),32) SETTINGS lightweight_deletes_sync=1", p); err != nil {
+				if err := d.ch.exec(ctx, "DELETE FROM "+d.db+".requests WHERE request_id IN {ids:Array(String)} AND body_sha256!=repeat(char(0),32) SETTINGS lightweight_deletes_sync=1,max_execution_time=300", p); err != nil {
 					return err
 				}
 			}

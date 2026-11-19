@@ -186,7 +186,15 @@ func (s *sink) flushNow() {
 	batches := s.retry
 	s.retry = nil
 	for table, rows := range s.pending {
-		batches = append(batches, newBatch(table, rows))
+		for len(rows) > 0 {
+			n, size := 1, len(rows[0])
+			for n < len(rows) && size+len(rows[n]) <= flushBytes {
+				size += len(rows[n])
+				n++
+			}
+			batches = append(batches, newBatch(table, rows[:n]))
+			rows = rows[n:]
+		}
 	}
 	s.pending = make(map[string][][]byte)
 	dropped := s.dropped

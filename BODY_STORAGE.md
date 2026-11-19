@@ -1,6 +1,6 @@
 # Store each repeated request item once
 
-`body-dedup: true` stores redacted protocol items in `body_blobs` and a byte skeleton in `requests`. The default is **false** in v0.1.0-plana.7. Responses stay inline. The plugin redacts the complete row before it computes a lineage or a hash.
+`body-dedup: true` stores redacted protocol items in `body_blobs` and a byte skeleton in `requests`. The default is **false** in v0.1.0-plana.8. Responses stay inline. The plugin redacts the complete row before it computes a lineage or a hash.
 
 `bodystore.Split` extracts messages, Responses input items, Gemini contents, tools, and system or instruction values. Invalid input falls back to a whole-body item. It never reserializes JSON. Every reconstruction checks each item's truncated SHA-256 and the request's full SHA-256. Missing or corrupt content returns `body incomplete`. The SQL view returns an empty body and `body_status = 'incomplete'`.
 
@@ -8,7 +8,7 @@ The wire format for new plugin rows is RowBinary. JSON strings cannot preserve a
 
 ## Roll out without changing existing rows
 
-1. Deploy `clickhouse-deriver-linux-arm64` from v0.1.0-plana.7. Keep the existing password-file mount and existing resource settings. Its startup adds columns with `ADD COLUMN IF NOT EXISTS`, creates `body_blobs` and `raw_request`, and keeps reading legacy rows. It retains 16-row, 8 MiB batches, 512 rows per pass, a 256 MiB query limit, and the fresh/backlog split.
+1. Deploy `clickhouse-deriver-linux-arm64` from v0.1.0-plana.8. Keep the existing password-file mount and existing resource settings. Its startup adds columns with `ADD COLUMN IF NOT EXISTS`, creates `body_blobs` and `raw_request`, and keeps reading legacy rows. It retains 16-row, 8 MiB batches, 512 rows per pass, a 256 MiB query limit, and the fresh/backlog split.
 2. Deploy every UI and export reader with `bodystore.Reader` before enabling dedup. This repository does not deploy the archive UI. Old readers see an empty request body for dedup rows.
 3. Install the plugin from the same release. Enable the following setting in the existing plugin config. Keep the existing URL, database, username, password injection, and redaction settings.
 
@@ -66,7 +66,7 @@ The loop writes metadata-only facts with `parse_status='body_incomplete'` when r
 
 ## Grants and release identity
 
-Both plugin and deriver execute schema DDL even with dedup disabled. The writer needs SELECT, INSERT, CREATE TABLE, ALTER TABLE, CREATE VIEW, and DROP VIEW in the target database. Migration and restore also need ALTER DELETE and memory metric reads. An operator must grant `SELECT(metric,value) ON system.asynchronous_metrics` and `SELECT(name,value) ON system.server_settings` to the migration user before running these commands. A database-only grant does not cover those reads. The command refuses to run if the metrics are unavailable. This document does not change grants or production settings.
+Both plugin and deriver execute schema DDL even with dedup disabled. The writer needs SELECT, INSERT, CREATE TABLE, ALTER TABLE, CREATE VIEW, and DROP VIEW in the target database. Migration and restore also need ALTER DELETE, memory metric reads, and SYSTEM JEMALLOC PURGE. Follow the users.d grants and procedure in [MIGRATION_RUNBOOK.md](MIGRATION_RUNBOOK.md). A database-only grant does not cover those reads. The command refuses to run if the metrics are unavailable. This document does not change grants or production settings.
 
 Release tags and uploaded assets are immutable. Cut a new version for every changed binary, never force-move a tag or replace an existing release. Pin downloads by the full SHA-256 in the release's `SHA256SUMS`, verify the manifest and every downloaded asset before installation, and record the tag's commit. The release job refuses to publish over an existing release. ClickHouse 25.8 CI and the host test pin the service image by digest.
 
@@ -74,22 +74,8 @@ Blob repair must use `INSERT INTO cliproxy.body_blobs ... SETTINGS insert_dedupl
 
 ## Keep the migration below the server memory limit
 
-Before migrate or restore, an operator must check the following query. The command runs the same check and requires resident memory below 60% of the configured server limit.
+Migration reserves its query limit plus 128 MiB below the tracked server limit. It also reserves its query limit below the cgroup container limit and 128 MiB of RSS below the server limit. It waits five seconds and checks again when headroom is unavailable. At RSS pressure it runs `SYSTEM JEMALLOC PURGE` before waiting. Missing metric or purge permissions stop the command safely. No ClickHouse restart is required by this procedure.
 
-```sql
-SELECT
- (SELECT value FROM system.asynchronous_metrics WHERE metric='MemoryResident') AS resident,
- (SELECT toFloat64(value) FROM system.server_settings WHERE name='max_server_memory_usage') AS server_limit,
- resident/server_limit AS fraction;
-```
+Synchronous deletes have a five-minute statement timeout. Codes 241, 394, 159 and transport failures retry at most five times with 1, 2, 4 and 8 second backoffs. The durable cursor advances only after verified reconstruction and completed deletion. An interrupted command resumes from that cursor.
 
-Stop other migration commands. If the preflight refuses, inspect idle server memory and run `SYSTEM JEMALLOC PURGE` as an operator with that privilege before trying again. Do not raise memory limits to bypass the guard. The command checks before every batch and stops at 75%. It retains all unverified source copies and resumes after the last verified deletion. ClickHouse code 241 and network errors retry at most five attempts with 1, 2, 4, and 8 second backoffs. A persistent error stops the command with its real cause. Missing or corrupt blobs name the request and report `body incomplete`.
-
-Check merge failures before and after migration or restore.
-
-```sql
-SELECT count(),max(event_time) FROM system.part_log
-WHERE event_time>now()-INTERVAL 1 HOUR AND error=241;
-```
-
-After verification, run `SYSTEM JEMALLOC PURGE` before `OPTIMIZE TABLE cliproxy.requests FINAL` if memory is high. ClickHouse 25.8 can retain untracked jemalloc memory and reject FINAL with code 241 even when tracked query memory is small. FINAL also needs temporary disk space for expanded parts. Recheck memory and part_log afterwards. The migration guard cannot prevent memory growth from unrelated queries, system logs, or idle server activity.
+Use `system.errors` and the server log to inspect failures. Production disables `system.part_log`. Do not force `OPTIMIZE FINAL` under live capture. Deleted inline bytes can be reclaimed by normal background merges.

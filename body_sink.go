@@ -15,6 +15,7 @@ import (
 )
 
 type bodyRequest struct {
+	size    int
 	row     requestRow
 	lineage uint64
 	sk      bodystore.Skeleton
@@ -49,6 +50,7 @@ func (s *sink) addRequest(row requestRow) {
 	for _, v := range r.blobs {
 		size += len(v) + 40
 	}
+	r.size = size
 	s.mu.Lock()
 	if s.buffered+size > maxBufferedBytes {
 		s.dropped++
@@ -233,9 +235,18 @@ func (s *sink) flushBodies(cfg sinkConfig) error {
 		s.mu.Lock()
 		u := s.bodyRetry
 		if u == nil && len(s.bodyPending) > 0 {
-			u = &bodyUnit{requests: s.bodyPending, size: s.bodyPendingSize, cfg: cfg, schemaOK: true}
-			s.bodyPending = nil
-			s.bodyPendingSize = 0
+			n, size := 0, 0
+			for n < len(s.bodyPending) {
+				next := s.bodyPending[n].size
+				if n > 0 && size+next > flushBytes {
+					break
+				}
+				size += next
+				n++
+			}
+			u = &bodyUnit{requests: s.bodyPending[:n:n], size: size, cfg: cfg, schemaOK: true}
+			s.bodyPending = s.bodyPending[n:]
+			s.bodyPendingSize -= size
 			s.bodyRetry = u
 		}
 		s.mu.Unlock()

@@ -28,14 +28,14 @@ type migrationBody struct {
 
 func (d *deriver) migrate(ctx context.Context, dry bool) (migrationReport, error) {
 	report := migrationReport{DryRun: dry}
-	if err := d.migrationMemory(ctx, 0.60); err != nil {
+	if err := d.migrationMemory(ctx); err != nil {
 		return report, err
 	}
 	cursor := migrationCursor{migrationCandidate: migrationCandidate{TS: epoch}}
 	var dryCandidates []migrationCandidate
 	if dry {
 		var err error
-		dryCandidates, err = migrationRows[migrationCandidate](ctx, d.ch, "SELECT DISTINCT request_id,started_at FROM "+d.db+`.requests WHERE request_body!='' AND request_id IN (SELECT request_id FROM `+d.db+`.request_facts) ORDER BY started_at,request_id SETTINGS max_threads=1`, nil)
+		dryCandidates, err = migrationRows[migrationCandidate](ctx, d.ch, "SELECT DISTINCT request_id,started_at FROM "+d.db+`.requests WHERE request_body!='' AND request_id IN (SELECT request_id FROM `+d.db+`.request_facts) ORDER BY started_at,request_id SETTINGS max_threads=1,max_block_size=1,preferred_block_size_bytes=1048576`, nil)
 		if err != nil {
 			return report, err
 		}
@@ -91,7 +91,7 @@ func (d *deriver) migrate(ctx context.Context, dry bool) (migrationReport, error
 				dryCandidates = dryCandidates[1:]
 			}
 		}
-		if err := d.migrationMemory(ctx, 0.75); err != nil {
+		if err := d.migrationMemory(ctx); err != nil {
 			return report, err
 		}
 		if err := migrationRetry(ctx, func() error { return d.migrateBatch(ctx, batch, dry, dryKeys, &report) }); err != nil {
@@ -198,7 +198,7 @@ func (d *deriver) migrateBatch(ctx context.Context, rows []migrationBody, dry bo
 		if err := d.verifyMigrationBatch(ctx, ids, digests, false); err != nil {
 			return err
 		}
-		if err := d.ch.exec(ctx, "DELETE FROM "+d.db+".requests WHERE request_id IN {ids:Array(String)} AND body_sha256=repeat(char(0),32) SETTINGS lightweight_deletes_sync=1", p); err != nil {
+		if err := d.ch.exec(ctx, "DELETE FROM "+d.db+".requests WHERE request_id IN {ids:Array(String)} AND body_sha256=repeat(char(0),32) SETTINGS lightweight_deletes_sync=1,max_execution_time=300", p); err != nil {
 			return err
 		}
 	}

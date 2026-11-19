@@ -89,7 +89,7 @@ func (r Reader) Load(ctx context.Context, ids []string) (map[Key][]byte, error) 
 
 func (r Reader) load(ctx context.Context, predicate string, params map[string]string) (map[Key][]byte, error) {
 	rc, err := r.Query(ctx, `SELECT lineage, hex(hash) AS hash_hex, base64Encode(data) AS data FROM `+r.Database+`.body_blobs
- WHERE (lineage,hash) IN (SELECT lineage,arrayJoin(body_refs) FROM `+r.Database+`.requests PREWHERE `+predicate+`) LIMIT 1 BY lineage,hash SETTINGS max_threads=1 FORMAT JSONEachRow`, params)
+ PREWHERE (lineage,hash) IN (SELECT lineage,arrayJoin(body_refs) FROM `+r.Database+`.requests PREWHERE `+predicate+`) LIMIT 1 BY lineage,hash SETTINGS max_threads=1 FORMAT JSONEachRow`, params)
 	if err != nil {
 		return nil, err
 	}

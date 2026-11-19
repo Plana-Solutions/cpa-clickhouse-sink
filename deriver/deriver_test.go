@@ -483,15 +483,12 @@ func TestRestoreKeepsSkeletonOnIncompleteBody(t *testing.T) {
 // The shared integration server retains allocator pages from preceding test suites.
 func prepareMigrationMemory(t *testing.T, d *deriver) {
 	t.Helper()
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	if err := d.ch.exec(ctx, "SYSTEM JEMALLOC PURGE", nil); err != nil {
 		t.Fatal(err)
 	}
-	for attempt := 0; attempt < 20; attempt++ {
-		if err := d.migrationMemory(ctx, .60); err == nil {
-			return
-		}
-		time.Sleep(250 * time.Millisecond)
+	if err := d.migrationMemory(ctx); err != nil {
+		t.Fatal(err)
 	}
-	t.Fatal(d.migrationMemory(ctx, .60))
 }

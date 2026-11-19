@@ -21,8 +21,15 @@ func migrationRetry(ctx context.Context, fn func() error) error {
 		var ch *chError
 		var network net.Error
 		var stream *bodystore.StreamError
-		transient := errors.As(err, &ch) && chCode.FindStringSubmatch(ch.msg) != nil && chCode.FindStringSubmatch(ch.msg)[1] == "241"
-		transient = transient || errors.As(err, &network) || errors.Is(err, io.ErrUnexpectedEOF) || (errors.As(err, &stream) && stream.Code == 241)
+		code := 0
+		if errors.As(err, &ch) {
+			if m := chCode.FindStringSubmatch(ch.msg); m != nil {
+				fmt.Sscan(m[1], &code)
+			}
+		} else if errors.As(err, &stream) {
+			code = stream.Code
+		}
+		transient := code == 241 || code == 394 || code == 159 || errors.As(err, &network) || errors.Is(err, io.ErrUnexpectedEOF)
 		if !transient {
 			return err
 		}
@@ -47,25 +54,46 @@ func migrationRows[T any](ctx context.Context, c *clickhouse, query string, para
 	return rows, err
 }
 
-func (d *deriver) migrationMemory(ctx context.Context, fraction float64) error {
-	type metric struct {
-		Resident float64 `json:"resident"`
-		Limit    float64 `json:"limit"`
-	}
-	rows, err := migrationRows[metric](ctx, d.ch, `SELECT
+type migrationMemory struct {
+	Resident float64 `json:"resident"`
+	Tracked  float64 `json:"tracked"`
+	Limit    float64 `json:"limit"`
+	Total    float64 `json:"total"`
+}
+
+func (m migrationMemory) available(queryBytes int64) bool {
+	return m.Tracked+float64(queryBytes)+(128<<20) < m.Limit && m.Resident+float64(queryBytes) < m.Total && m.Resident+(128<<20) < m.Limit
+}
+
+func (d *deriver) migrationMemory(ctx context.Context) error {
+	for {
+		rows, err := migrationRows[migrationMemory](ctx, d.ch, `SELECT
     (SELECT value FROM system.asynchronous_metrics WHERE metric='MemoryResident') AS resident,
+    (SELECT value FROM system.asynchronous_metrics WHERE metric='TrackedMemory') AS tracked,
+    (SELECT value FROM system.asynchronous_metrics WHERE metric='CGroupMemoryTotal') AS total,
     (SELECT toFloat64(value) FROM system.server_settings WHERE name='max_server_memory_usage') AS limit`, nil)
-	if err != nil {
-		return fmt.Errorf("server memory check requires SELECT on system.asynchronous_metrics and system.server_settings: %w", err)
+		if err != nil {
+			return fmt.Errorf("server memory check requires SELECT on system.asynchronous_metrics and system.server_settings: %w", err)
+		}
+		if len(rows) != 1 || rows[0].Resident <= 0 || rows[0].Tracked <= 0 || rows[0].Limit <= 0 || rows[0].Total <= 0 {
+			return fmt.Errorf("server memory metrics or cgroup limit unavailable; migration refused")
+		}
+		m := rows[0]
+		if m.available(d.ch.memoryBytes) {
+			return nil
+		}
+		if m.Resident+(128<<20) >= m.Limit {
+			if err := d.ch.exec(ctx, "SYSTEM JEMALLOC PURGE", nil); err != nil {
+				return fmt.Errorf("migration memory pressure requires SYSTEM JEMALLOC PURGE privilege: %w", err)
+			}
+		}
+		d.log.Info("migration waiting for memory headroom", "resident", m.Resident, "tracked", m.Tracked, "server_limit", m.Limit, "container_limit", m.Total)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
 	}
-	if len(rows) != 1 || rows[0].Resident <= 0 || rows[0].Limit <= 0 {
-		return fmt.Errorf("server memory metrics unavailable; migration refused")
-	}
-	r := rows[0]
-	if r.Resident >= r.Limit*fraction {
-		return fmt.Errorf("server MemoryResident %.0f exceeds %.0f%% of server limit %.0f; stop and inspect memory", r.Resident, fraction*100, r.Limit)
-	}
-	return nil
 }
 
 type migrationCandidate struct {
