@@ -2,6 +2,7 @@ package bodystore
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,5 +48,22 @@ func TestReadBatchValidatesIDsAndStreamErrors(t *testing.T) {
 		if !errors.As(err, &stream) || stream.Code != 241 || errors.Is(err, ErrIncomplete) {
 			t.Fatalf("server error misclassified: %v", err)
 		}
+	}
+}
+
+func TestSkeletonBatchDoesNotUseInline(t *testing.T) {
+	reader := Reader{Database: "cliproxy", Query: func(ctx context.Context, q string, p map[string]string) (io.ReadCloser, error) {
+		if strings.Contains(q, "FROM cliproxy.body_blobs") {
+			return io.NopCloser(strings.NewReader("")), nil
+		}
+		data := fmt.Sprintf(`{"request_id":"a","body_inline":"e30=","body_len":2,"body_sha":"%x","body_hashes":["%s"],"body_ref_offsets":[0]}`, sha256.Sum256([]byte("{}")), strings.Repeat("12", 16))
+		return io.NopCloser(strings.NewReader(data)), nil
+	}}
+	fn := func(id, ts string, b []byte) error { return nil }
+	if err := reader.ReadBatch(context.Background(), []string{"a"}, fn); err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.ReadSkeletonBatch(context.Background(), []string{"a"}, fn); !errors.Is(err, ErrIncomplete) {
+		t.Fatal("skeleton verification used inline bytes", err)
 	}
 }

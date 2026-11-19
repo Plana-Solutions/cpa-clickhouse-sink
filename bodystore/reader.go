@@ -219,6 +219,15 @@ func streamError(raw []byte) error {
 
 // ReadBatch reconstructs only bodies, without loading response payloads or other capture fields.
 func (r Reader) ReadBatch(ctx context.Context, ids []string, fn func(string, string, []byte) error) error {
+	return r.readBatch(ctx, ids, fn, true)
+}
+
+// ReadSkeletonBatch proves skeletons are complete without relying on inline recovery copies.
+func (r Reader) ReadSkeletonBatch(ctx context.Context, ids []string, fn func(string, string, []byte) error) error {
+	return r.readBatch(ctx, ids, fn, false)
+}
+
+func (r Reader) readBatch(ctx context.Context, ids []string, fn func(string, string, []byte) error, inlineFallback bool) error {
 	blobs, err := r.Load(ctx, ids)
 	if err != nil {
 		return err
@@ -229,7 +238,11 @@ func (r Reader) ReadBatch(ctx context.Context, ids []string, fn func(string, str
 		pending[id] = true
 		vals[i] = "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(id) + "'"
 	}
-	rc, err := r.Query(ctx, "SELECT request_id,started_at,"+Projection+" FROM "+r.Database+`.requests PREWHERE request_id IN {ids:Array(String)} ORDER BY body_sha256=repeat(char(0),32) LIMIT 1 BY request_id SETTINGS max_threads=1,max_block_size=1,preferred_block_size_bytes=1048576 FORMAT JSONEachRow`, map[string]string{"ids": "[" + strings.Join(vals, ",") + "]"})
+	filter := ""
+	if !inlineFallback {
+		filter = " AND body_sha256!=repeat(char(0),32)"
+	}
+	rc, err := r.Query(ctx, "SELECT request_id,started_at,"+Projection+" FROM "+r.Database+`.requests PREWHERE request_id IN {ids:Array(String)}`+filter+` ORDER BY body_sha256=repeat(char(0),32) LIMIT 1 BY request_id SETTINGS max_threads=1,max_block_size=1,preferred_block_size_bytes=1048576 FORMAT JSONEachRow`, map[string]string{"ids": "[" + strings.Join(vals, ",") + "]"})
 	if err != nil {
 		return err
 	}
@@ -252,8 +265,11 @@ func (r Reader) ReadBatch(ctx context.Context, ids []string, fn func(string, str
 			return fmt.Errorf("unexpected or duplicate request id in body batch")
 		}
 		delete(pending, row.ID)
+		if !inlineFallback {
+			row.Inline = ""
+		}
 		body, err := row.Body.Restore(blobs)
-		if errors.Is(err, ErrIncomplete) {
+		if inlineFallback && errors.Is(err, ErrIncomplete) {
 			body, err = r.readInline(ctx, `request_id={id:String} AND started_at={ts:DateTime64(9,'UTC')}`, map[string]string{"id": row.ID, "ts": row.TS})
 		}
 		if err != nil {

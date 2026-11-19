@@ -252,7 +252,7 @@ func (d *deriver) verifyMigrationBatch(ctx context.Context, ids []string, want m
 	if inline {
 		return nil
 	}
-	return d.bodyReader().ReadBatch(ctx, ids, func(id, ts string, body []byte) error {
+	return d.bodyReader().ReadSkeletonBatch(ctx, ids, func(id, ts string, body []byte) error {
 		if sha256.Sum256(body) != want[id] {
 			return fmt.Errorf("verify migrated request %s: %w", id, bodystore.ErrIncomplete)
 		}
