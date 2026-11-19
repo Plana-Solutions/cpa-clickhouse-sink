@@ -153,3 +153,24 @@ func TestMigrationRetriesCancelledDelete(t *testing.T) {
 		}
 	}
 }
+
+func TestMigrationSizePreflightRefusesBeforePayloadReads(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if strings.Contains(string(b), "system.asynchronous_metrics") {
+			fmt.Fprintln(w, `{"resident":500000000,"tracked":300000000,"limit":1610612736,"total":2147483648}`)
+		} else if strings.Contains(string(b), "max(length(request_body))") {
+			fmt.Fprintln(w, `{"max_body":16777217}`)
+		} else {
+			t.Errorf("preflight read payloads or mutated state: %s", b)
+		}
+	}))
+	defer srv.Close()
+	ch := newClickHouse(srv.URL, "", "")
+	ch.memoryBytes = 128 << 20
+	d := newDeriver(ch, "cliproxy", slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
+	_, err := d.migrate(context.Background(), true)
+	if err == nil || !strings.Contains(err.Error(), "8 * max(length(request_body))") {
+		t.Fatal(err)
+	}
+}

@@ -229,8 +229,7 @@ func (s *sink) insertBlobs(cfg sinkConfig, b batch, keys []bodystore.Key, bad ma
 }
 
 func (s *sink) flushBodies(cfg sinkConfig) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
+	ctx := context.Background()
 	for {
 		s.mu.Lock()
 		u := s.bodyRetry

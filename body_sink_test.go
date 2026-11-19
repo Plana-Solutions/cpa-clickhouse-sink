@@ -370,3 +370,34 @@ func TestOutageBacklogInsertCaps(t *testing.T) {
 		})
 	}
 }
+
+func TestPreloadGetsFreshDeadlineAfterSlowUnit(t *testing.T) {
+	preloads := 0
+	delayed := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		if strings.HasPrefix(string(b), "SELECT hex(hash)") {
+			preloads++
+			return
+		}
+		if !delayed && strings.Contains(r.URL.Query().Get("query"), "requests") {
+			delayed = true
+			time.Sleep(3100 * time.Millisecond)
+		}
+	}))
+	defer server.Close()
+	s := newSink(sinkConfig{URL: server.URL, Database: "test", BodyDedup: true})
+	s.schemaOK = true
+	for _, id := range []string{"a", "b"} {
+		s.addRequest(requestRow{RequestID: id, StartedAt: formatTime(time.Now()), CompletedAt: formatTime(time.Now()), RequestHeaders: map[string]string{"session-id": id}, RequestBody: `{"messages":["payload"]}`})
+	}
+	s.bodyPending[0].size = flushBytes
+	s.bodyPendingSize += flushBytes
+	s.buffered += flushBytes
+	if err := s.flushBodies(s.cfg); err != nil {
+		t.Fatal(err)
+	}
+	if preloads != 2 {
+		t.Fatalf("preloaded %d lineages after slow unit, want 2", preloads)
+	}
+}

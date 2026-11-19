@@ -35,7 +35,7 @@ func main() {
 	maxRows := flag.Int("max-rows-per-pass", 512, "maximum rows per pass; half reserved for fresh rows")
 	queryDefault := int64(256 << 20)
 	if migrate || restore {
-		queryDefault = 64 << 20
+		queryDefault = 128 << 20
 	}
 	queryMemory := flag.Int64("query-memory-bytes", queryDefault, "ClickHouse memory limit per deriver query")
 	flag.Parse()

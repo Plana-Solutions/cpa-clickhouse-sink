@@ -428,13 +428,16 @@ func TestMigrateNewSkeleton(t *testing.T) {
 	ctx := context.Background()
 	r := fixtureRow(t, "chat_stream", "new-migration", time.Now().Add(-15*time.Minute))
 	// A large value outside protocol items exercises binary skeleton transport.
-	r.RequestBody = `{"extra":"` + strings.Repeat("a", 2<<20) + `","messages":[{"role":"user","content":"hello"}]}`
+	prefix := `{"extra":"` + strings.Repeat("a", 2<<20) + `","messages":[{"role":"user","content":"`
+	suffix := `"}]}`
+	r.RequestBody = prefix + strings.Repeat("b", (16<<20)-len(prefix)-len(suffix)) + suffix
 	other := r
 	other.RequestID = "second-migration"
 	insertRaw(t, d, r, other)
 	if _, err := d.rebuild(ctx); err != nil {
 		t.Fatal(err)
 	}
+	d.ch.memoryBytes = 128 << 20
 	prepareMigrationMemory(t, d)
 	dry, err := d.migrate(ctx, true)
 	if err != nil || dry.Rows != 2 {
@@ -490,5 +493,25 @@ func prepareMigrationMemory(t *testing.T, d *deriver) {
 	}
 	if err := d.migrationMemory(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFetchIncompleteSkeletonFallsBackInline(t *testing.T) {
+	d := testDeriver(t)
+	r := fixtureRow(t, "chat_stream", "fallback", time.Now())
+	insertRaw(t, d, r)
+	if err := d.ch.exec(context.Background(), `INSERT INTO `+testDB+`.requests SELECT * EXCEPT(duration_ms) REPLACE('' AS request_body,2 AS body_len,SHA256('{}') AS body_sha256,[repeat('x',16)] AS body_refs,[toUInt32(0)] AS body_ref_offsets) FROM `+testDB+`.requests WHERE request_id='fallback'`, nil); err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	err := d.fetch(context.Background(), []string{"fallback"}, func(row extract.Row) error {
+		called = true
+		if row.BodyIncomplete || row.RequestBody != r.RequestBody {
+			t.Fatal("inline recovery failed")
+		}
+		return nil
+	})
+	if err != nil || !called {
+		t.Fatal(err, called)
 	}
 }

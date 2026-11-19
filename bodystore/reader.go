@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -68,14 +69,35 @@ func (r Reader) Read(ctx context.Context, id string, startedAt ...string) ([]byt
 			return nil, err
 		}
 	}
-	if len(row.Refs) == 0 {
-		return row.Restore(nil)
+	var blobs map[Key][]byte
+	if len(row.Refs) > 0 && row.Inline == "" {
+		var err error
+		blobs, err = r.load(ctx, predicate, params)
+		if err != nil {
+			return nil, err
+		}
 	}
-	blobs, err := r.load(ctx, predicate, params)
+	body, err := row.Restore(blobs)
+	if errors.Is(err, ErrIncomplete) {
+		return r.readInline(ctx, predicate, params)
+	}
+	return body, err
+}
+
+func (r Reader) readInline(ctx context.Context, predicate string, params map[string]string) ([]byte, error) {
+	rc, err := r.Query(ctx, "SELECT "+Projection+" FROM "+r.Database+`.requests PREWHERE `+predicate+` AND length(request_body)>0 ORDER BY body_sha256=repeat(char(0),32) LIMIT 1 SETTINGS max_threads=1,max_block_size=1 FORMAT JSONEachRow`, params)
 	if err != nil {
 		return nil, err
 	}
-	return row.Restore(blobs)
+	defer rc.Close()
+	var row Body
+	if err := DecodeRow(json.NewDecoder(rc), &row); err != nil {
+		if err == io.EOF {
+			return nil, ErrIncomplete
+		}
+		return nil, err
+	}
+	return row.Restore(nil)
 }
 
 // Load fetches only the distinct items referenced by this bounded batch.
@@ -231,6 +253,9 @@ func (r Reader) ReadBatch(ctx context.Context, ids []string, fn func(string, str
 		}
 		delete(pending, row.ID)
 		body, err := row.Body.Restore(blobs)
+		if errors.Is(err, ErrIncomplete) {
+			body, err = r.readInline(ctx, `request_id={id:String} AND started_at={ts:DateTime64(9,'UTC')}`, map[string]string{"id": row.ID, "ts": row.TS})
+		}
 		if err != nil {
 			return fmt.Errorf("request %s: %w", row.ID, err)
 		}

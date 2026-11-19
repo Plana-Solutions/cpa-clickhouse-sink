@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -291,7 +292,7 @@ func (d *deriver) fetch(ctx context.Context, ids []string, fn func(extract.Row) 
  duration_ms, path, source_format, model, stream, outcome, status_code, error,
  request_headers, response_body, response_chunks, redaction_count, ` + bodystore.Projection + `
 FROM ` + d.db + `.requests PREWHERE request_id IN {ids:Array(String)}
-ORDER BY request_body = '' DESC LIMIT 1 BY request_id)
+ORDER BY body_sha256=repeat(char(0),32) LIMIT 1 BY request_id)
 ORDER BY ingested_at,request_id
 SETTINGS max_threads=1, max_block_size=1, preferred_block_size_bytes=1048576`
 	type stored struct {
@@ -308,6 +309,12 @@ SETTINGS max_threads=1, max_block_size=1, preferred_block_size_bytes=1048576`
 		}
 		delete(pending, r.RequestID)
 		body, err := r.Body.Restore(blobs)
+		if errors.Is(err, bodystore.ErrIncomplete) {
+			body, err = d.bodyReader().Read(ctx, r.RequestID, r.StartedAt)
+			if err != nil && !errors.Is(err, bodystore.ErrIncomplete) {
+				return err
+			}
+		}
 		if err != nil {
 			d.log.Warn("body incomplete", "request_id", r.RequestID)
 			r.Row.BodyIncomplete = true
