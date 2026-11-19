@@ -4,25 +4,33 @@ This procedure targets ClickHouse 25.8 with a 2 GiB container, a 0.75 server mem
 
 ## Prepare permissions and a rollback copy
 
-1. Verify the plana.8 assets against `SHA256SUMS`. Deploy the new reader view and deriver before migration. Keep the existing 16-row and 8 MiB batch limits. The normal deriver retains its 256 MiB query cap. Migration and restore now default to a 64 MiB query cap.
+1. Verify the plana.9 assets against `SHA256SUMS`. Deploy the new reader view and deriver before migration. Keep the existing 16-row and 8 MiB batch limits. The normal deriver retains its 256 MiB query cap. Migration and restore default to a 128 MiB query cap. This covers inline request bodies up to 16 MiB. Migration refuses larger bodies at the size preflight before the candidate snapshot or payload reads.
 2. Confirm normal capture and derivation work without code 241 or OOM kills. Stop any other migration or restore command. Keep capture and the normal deriver running.
 3. An operator must add the following entries to the existing migration user's `users.d` XML grants. Keep its existing `GRANT ALL ON cliproxy.*` entry. These grants are required only by migration and restore. The normal reader needs no system grants.
 
    ```xml
    <query>GRANT SELECT(metric,value) ON system.asynchronous_metrics</query>
    <query>GRANT SELECT(name,value) ON system.server_settings</query>
+   <query>GRANT SELECT ON system.errors</query>
+   <query>GRANT SELECT ON system.mutations</query>
    <query>GRANT SYSTEM JEMALLOC PURGE ON *.*</query>
    ```
 
-   Reload the XML and test those privileges as that user. Do not put a password in shell arguments or logs. A database-only user fails safely at the memory preflight. A missing purge privilege fails safely if memory pressure later requires a purge.
-4. Confirm that every legacy row has a fact. The command only snapshots derived rows. This reads the body column once, so keep blocks small.
+   Edit `/opt/cpa/clickhouse/users.d/plana-users.xml` in place. It is a single read-only bind-mounted file. Preserve its inode with `sudo -n sh -c 'cat prepared-users.xml > /opt/cpa/clickhouse/users.d/plana-users.xml'`. Never use `sed -i`, an atomic rename, or an editor that replaces the file. Those writes leave the container on the old inode and silently retain the old grants until restart. Wait at least five seconds, then test every grant as `cliproxy`, including the monitoring queries below. Do not put a password in shell arguments or logs. A database-only user fails safely at the memory preflight. A missing purge privilege fails safely if memory pressure later requires a purge.
+4. Confirm that every legacy row has a fact. The command only snapshots derived rows. Use size predicates so ClickHouse does not select full body rows. Check the largest inline body first.
 
    ```sql
+   SELECT max(length(request_body)) AS max_inline_body_bytes
+   FROM cliproxy.requests
+   SETTINGS max_threads=1,max_execution_time=300,max_memory_usage=134217728;
+
    SELECT count() FROM cliproxy.requests
-   WHERE request_body!='' AND request_id NOT IN
+   WHERE length(request_body)>0 AND request_id NOT IN
      (SELECT request_id FROM cliproxy.request_facts)
    SETTINGS max_threads=1,max_block_size=1,max_memory_usage=268435456;
    ```
+
+   Require zero underived legacy rows and `max_inline_body_bytes <= 16777216` with the shipped defaults. The tool repeats the maximum-length preflight, requires `query-memory-bytes >= 8 * max_inline_body_bytes`, and checks available server headroom. Do not raise the query cap without repeating the live-load qualification for the larger bodies and full response fields.
 
 5. Save `SHOW CREATE TABLE cliproxy.requests`. Create a rollback table and attach each active request partition from the source. This uses hard links, keeps the original body bytes available, and avoids a full-body backup query. Run as an operator with the database permissions. Replace the month with each existing partition. Keep at least 10 GB free for diverging parts and merges.
 
@@ -34,16 +42,31 @@ This procedure targets ClickHouse 25.8 with a 2 GiB container, a 0.75 server mem
 
 ## Run and monitor
 
-Use the deriver's existing environment and password-file mount. Do not pass secrets on the command line.
+On the production Docker host for Portainer stack 29, use its `cpa-clickhouse_default` network and existing writer secret mount. Build and verify `cpa-local/clickhouse-deriver:v0.1.0-plana.9` from the released binary before running. The normal deriver remains on its own 384 MiB container. The one-off migration container uses 768 MiB for Go body splitting and verification. Do not pass secrets on the command line.
 
 ```sh
-clickhouse-deriver-linux-arm64 migrate-bodies --dry-run
-clickhouse-deriver-linux-arm64 migrate-bodies
+sudo -n docker run --rm --name cpa-body-migration-dry \
+  --network cpa-clickhouse_default --read-only --memory 768m --cpus 0.5 \
+  -e GOMAXPROCS=1 \
+  -e CLICKHOUSE_URL=http://clickhouse:8123 \
+  -e CLICKHOUSE_DB=cliproxy -e CLICKHOUSE_USER=cliproxy \
+  -e CLICKHOUSE_PASSWORD_FILE=/run/secrets/ch_writer \
+  -v /opt/cpa/clickhouse/secrets/ch_writer:/run/secrets/ch_writer:ro \
+  cpa-local/clickhouse-deriver:v0.1.0-plana.9 migrate-bodies --dry-run
+
+sudo -n docker run --rm --name cpa-body-migration \
+  --network cpa-clickhouse_default --read-only --memory 768m --cpus 0.5 \
+  -e GOMAXPROCS=1 \
+  -e CLICKHOUSE_URL=http://clickhouse:8123 \
+  -e CLICKHOUSE_DB=cliproxy -e CLICKHOUSE_USER=cliproxy \
+  -e CLICKHOUSE_PASSWORD_FILE=/run/secrets/ch_writer \
+  -v /opt/cpa/clickhouse/secrets/ch_writer:/run/secrets/ch_writer:ro \
+  cpa-local/clickhouse-deriver:v0.1.0-plana.9 migrate-bodies
 ```
 
 The dry run writes nothing. The real run saves its candidate snapshot and verified cursor in the database. It writes blobs, writes guarded skeleton copies, checks every reconstructed SHA-256, synchronously deletes verified inline copies, then commits the cursor. Repeating the same command resumes unfinished work. A completed run takes a new snapshot on the next invocation.
 
-The memory admission check reserves 192 MiB of tracked headroom with its default 64 MiB query cap. RSS must stay below 1.4375 GiB, and below the 2 GiB container limit minus the query cap. At RSS pressure the command purges unused jemalloc pages and waits five seconds before checking again. It never restarts ClickHouse. Sustained memory pressure pauses progress until the load subsides. Stop with SIGTERM if it remains stalled for ten minutes and inspect the live load.
+The memory admission check reserves 256 MiB of tracked headroom with its default 128 MiB query cap. RSS must stay below 1.375 GiB, and below the 2 GiB container limit minus the query cap. At RSS pressure the command purges unused jemalloc pages and waits five seconds before checking again. It never restarts ClickHouse. Sustained memory pressure pauses progress until the load subsides. Stop with SIGTERM if it remains stalled for ten minutes and inspect the live load.
 
 Check the following with an operator account. Production has no `system.part_log` and its database reader and writer lack system metric grants unless explicitly added above.
 
@@ -58,7 +81,7 @@ SELECT request_id,started_at,done FROM cliproxy.body_migration_progress
 ORDER BY saved_at DESC LIMIT 1;
 ```
 
-Record `system.errors` counters before the run so old errors do not count as new failures. Check the ClickHouse server log and the capture log too. The plugin now cuts both dedup and legacy queued inserts at 8 MiB. One oversized row runs alone.
+Record `system.errors` counters before the run. Its code-241 count includes reader-limit failures and is not a live-insert error count. Take live-insert 241s from the CPA capture log, matching `clickhouse-sink` insert failures and `Code: 241`. Capture the log since migration start, preserve it before cleanup, and distinguish retries from lost rows. Check the ClickHouse server log too. The plugin now cuts both dedup and legacy queued inserts at 8 MiB. One oversized row runs alone.
 
 Abort migration on any live-insert code 241, OOM kill, capture drop, repeated insert retries, incomplete reconstruction, SHA mismatch, failed mutation, or a growing fact backlog. SIGTERM leaves verified skeletons and unverified source copies available. Do not restart ClickHouse to force admission.
 
@@ -72,8 +95,6 @@ To restore inline storage, disable new dedup writes, stop migration, and run `re
 
 ## Measurements and planning
 
-See [the qualification record](verification/plana8.md) for the corpus, query memory and read-byte counters, concurrent-load results, failed trials and limitations. The production code-241 lookup failure did not reproduce in the synthetic fixture, so the measured lookup improvement must not be described as a reproduced production fix.
+See [the plana.9 qualification record](verification/plana9.md) for the production-shaped corpus, per-view memory bounds, concurrent load, fault injections, and byte-exact audit. Earlier [plana.8 numbers](verification/plana8.md) use uniform single-item bodies and do not qualify migration of production's large rows.
 
-The production-matched qualification completed 3,225 conversions and 597 live writes in 607 seconds, with zero insert errors, new code-241 events, drops, OOM kills or ClickHouse restarts. Five-second sampled server RSS peaked at 1.23 GiB and tracked memory at 445 MiB.
-
-At the measured 5.31 rows/s, 8,000 rows take about 25 minutes. Production rows and response fields can be larger than this synthetic request-heavy fixture. Plan **45 to 90 minutes** for migration, the dry run, admission waits and verification. This is an extrapolation, not a production timing guarantee. Background disk reclamation is asynchronous and is not included.
+The synthetic qualification converted 8,000 historical rows in 1,345 seconds including upgrade and injected faults (5.95 rows/s). It observed 11 memory-admission waits and a 165-second progress gap across the deliberate outage. Plan additional time for the dry run and full audit. Production response fields and live load may differ, so this is not a production timing guarantee. Background disk reclamation is asynchronous and is not included. Keep the backup until independent acceptance passes.
