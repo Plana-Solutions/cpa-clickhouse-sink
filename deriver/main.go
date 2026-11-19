@@ -33,7 +33,11 @@ func main() {
 	batchRows := flag.Int("batch-rows", 16, "maximum bodies and facts per batch")
 	batchBytes := flag.Int("batch-bytes", 8<<20, "raw payload bytes per batch; one oversized row runs alone")
 	maxRows := flag.Int("max-rows-per-pass", 512, "maximum rows per pass; half reserved for fresh rows")
-	queryMemory := flag.Int64("query-memory-bytes", 256<<20, "ClickHouse memory limit per deriver query")
+	queryDefault := int64(256 << 20)
+	if migrate || restore {
+		queryDefault = 64 << 20
+	}
+	queryMemory := flag.Int64("query-memory-bytes", queryDefault, "ClickHouse memory limit per deriver query")
 	flag.Parse()
 	if *batchRows < 1 || *batchBytes < 1 || *maxRows < 2 || *interval <= 0 || *queryMemory < 1 {
 		fmt.Fprintln(os.Stderr, "batch and query memory limits must be positive, max-rows-per-pass >= 2, interval > 0")

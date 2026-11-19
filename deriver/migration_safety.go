@@ -62,7 +62,7 @@ type migrationMemory struct {
 }
 
 func (m migrationMemory) available(queryBytes int64) bool {
-	return m.Tracked+float64(queryBytes)+(128<<20) < m.Limit && m.Resident+float64(queryBytes) < m.Total && m.Resident+(128<<20) < m.Limit
+	return m.Tracked+float64(queryBytes)+(128<<20) < m.Limit && m.Resident+float64(queryBytes) < m.Total && m.Resident+float64(queryBytes) < m.Limit
 }
 
 func (d *deriver) migrationMemory(ctx context.Context) error {
@@ -82,7 +82,7 @@ func (d *deriver) migrationMemory(ctx context.Context) error {
 		if m.available(d.ch.memoryBytes) {
 			return nil
 		}
-		if m.Resident+(128<<20) >= m.Limit {
+		if m.Resident+float64(d.ch.memoryBytes) >= m.Limit {
 			if err := d.ch.exec(ctx, "SYSTEM JEMALLOC PURGE", nil); err != nil {
 				return fmt.Errorf("migration memory pressure requires SYSTEM JEMALLOC PURGE privilege: %w", err)
 			}

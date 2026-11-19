@@ -35,6 +35,13 @@ func TestMigrationMemoryHeadroom(t *testing.T) {
 	}
 }
 
+func TestMigrationAdmissionReservesItsQueryCap(t *testing.T) {
+	m := migrationMemory{Resident: 1450 << 20, Tracked: 600 << 20, Limit: 1536 << 20, Total: 2048 << 20}
+	if !m.available(64<<20) || m.available(256<<20) {
+		t.Fatal("RSS headroom must cover the configured query cap", m)
+	}
+}
+
 func TestMigrationMemoryWaitCancelsAndMissingGrantsRefuse(t *testing.T) {
 	for _, denied := range []bool{false, true} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

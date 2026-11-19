@@ -4,7 +4,7 @@ This procedure targets ClickHouse 25.8 with a 2 GiB container, a 0.75 server mem
 
 ## Prepare permissions and a rollback copy
 
-1. Verify the plana.8 assets against `SHA256SUMS`. Deploy the new reader view and deriver before migration. Keep the existing 16-row, 8 MiB batch limits and 256 MiB query cap.
+1. Verify the plana.8 assets against `SHA256SUMS`. Deploy the new reader view and deriver before migration. Keep the existing 16-row and 8 MiB batch limits. The normal deriver retains its 256 MiB query cap. Migration and restore now default to a 64 MiB query cap.
 2. Confirm normal capture and derivation work without code 241 or OOM kills. Stop any other migration or restore command. Keep capture and the normal deriver running.
 3. An operator must add the following entries to the existing migration user's `users.d` XML grants. Keep its existing `GRANT ALL ON cliproxy.*` entry. These grants are required only by migration and restore. The normal reader needs no system grants.
 
@@ -43,7 +43,7 @@ clickhouse-deriver-linux-arm64 migrate-bodies
 
 The dry run writes nothing. The real run saves its candidate snapshot and verified cursor in the database. It writes blobs, writes guarded skeleton copies, checks every reconstructed SHA-256, synchronously deletes verified inline copies, then commits the cursor. Repeating the same command resumes unfinished work. A completed run takes a new snapshot on the next invocation.
 
-The memory admission check reserves 384 MiB of tracked headroom with the default query cap. RSS must stay below 1.375 GiB, and below the 2 GiB container limit minus the query cap. At RSS pressure the command purges unused jemalloc pages and waits five seconds before checking again. It never restarts ClickHouse. Sustained memory pressure pauses progress until the load subsides. Stop with SIGTERM if it remains stalled for ten minutes and inspect the live load.
+The memory admission check reserves 192 MiB of tracked headroom with its default 64 MiB query cap. RSS must stay below 1.4375 GiB, and below the 2 GiB container limit minus the query cap. At RSS pressure the command purges unused jemalloc pages and waits five seconds before checking again. It never restarts ClickHouse. Sustained memory pressure pauses progress until the load subsides. Stop with SIGTERM if it remains stalled for ten minutes and inspect the live load.
 
 Check the following with an operator account. Production has no `system.part_log` and its database reader and writer lack system metric grants unless explicitly added above.
 

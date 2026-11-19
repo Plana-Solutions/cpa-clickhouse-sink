@@ -74,7 +74,7 @@ Blob repair must use `INSERT INTO cliproxy.body_blobs ... SETTINGS insert_dedupl
 
 ## Keep the migration below the server memory limit
 
-Migration reserves its query limit plus 128 MiB below the tracked server limit. It also reserves its query limit below the cgroup container limit and 128 MiB of RSS below the server limit. It waits five seconds and checks again when headroom is unavailable. At RSS pressure it runs `SYSTEM JEMALLOC PURGE` before waiting. Missing metric or purge permissions stop the command safely. No ClickHouse restart is required by this procedure.
+Migration reserves its query limit plus 128 MiB below the tracked server limit. It also reserves its query limit below the cgroup container limit and its query limit in RSS below the server limit. It waits five seconds and checks again when headroom is unavailable. At RSS pressure it runs `SYSTEM JEMALLOC PURGE` before waiting. Missing metric or purge permissions stop the command safely. No ClickHouse restart is required by this procedure.
 
 Synchronous deletes have a five-minute statement timeout. Codes 241, 394, 159 and transport failures retry at most five times with 1, 2, 4 and 8 second backoffs. The durable cursor advances only after verified reconstruction and completed deletion. An interrupted command resumes from that cursor.
 
