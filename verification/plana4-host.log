@@ -1,0 +1,22 @@
+request status=200 stream=False
+request status=200 stream=True
+request status=200 stream=False
+request status=200 stream=False
+request status=200 stream=True
+request status=200 stream=False
+[clickhouse-sink] insert 1 rows into body_blobs: ClickHouse 500 Internal Server Error: Code: 497. DB::Exception: sink: Not enough privileges. To execute this query, it's necessary to have the grant INSERT(lineage, hash, data, first_seen) ON cliproxy.body_blobs. (ACCESS_DENIED) (version 25.8.33.6 (official build)) (rows kept for retry)
+request status=200 stream=False
+request status=200 stream=True
+request status=200 stream=False
+Password rotation and hot-config recovery verified. requests=9 usage=9 no CPA restart
+Dedup production-image byte-exact SQL reconstruction verified. rows=9
+Missing blob stored as body_incomplete. Later good row derived. facts=11
+Production-image load verified. requests=9 usage=9 request_facts=11
+Released deriver verified in stock distroless image with mounted password file.
+[2026-11-19 04:20:01] [--------] [info ] [host.go:411] pluginhost: plugin loaded plugin_id=clickhouse-sink path=plugins/linux/arm64/clickhouse-sink.so
+[2026-11-19 04:20:01] [--------] [info ] [host.go:434] pluginhost: plugin registered plugin_id=clickhouse-sink plugin_name=clickhouse-sink version=0.1.0-plana.3 path=plugins/linux/arm64/clickhouse-sink.so
+[clickhouse-sink] body blobs written=1 skipped=2
+[clickhouse-sink] insert 1 rows into body_blobs: ClickHouse 500 Internal Server Error: Code: 497. DB::Exception: sink: Not enough privileges. To execute this query, it's necessary to have the grant INSERT(lineage, hash, data, first_seen) ON cliproxy.body_blobs. (ACCESS_DENIED) (version 25.8.33.6 (official build)) (rows kept for retry)
+[clickhouse-sink] body blobs written=2 skipped=6
+[clickhouse-sink] ClickHouse writes recovered
+[clickhouse-sink] body blobs written=3 skipped=8

@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -21,12 +22,22 @@ import (
 )
 
 func main() {
-	rebuild := flag.Bool("rebuild", false, "truncate request_facts, derive all raw rows, then exit (stop the loop service first)")
+	restore := len(os.Args) > 1 && os.Args[1] == "restore-bodies"
+	migrate := len(os.Args) > 1 && os.Args[1] == "migrate-bodies"
+	if migrate || restore {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+	}
+	dryRun := flag.Bool("dry-run", false, "report migration size without writing rows")
+	rebuild := flag.Bool("rebuild", false, "truncate request_facts, derive all raw rows, then exit (stop capture, migrations, blob GC, and the loop first)")
 	interval := flag.Duration("interval", 30*time.Second, "time between passes")
 	batchRows := flag.Int("batch-rows", 16, "maximum bodies and facts per batch")
 	batchBytes := flag.Int("batch-bytes", 8<<20, "raw payload bytes per batch; one oversized row runs alone")
 	maxRows := flag.Int("max-rows-per-pass", 512, "maximum rows per pass; half reserved for fresh rows")
-	queryMemory := flag.Int64("query-memory-bytes", 256<<20, "ClickHouse memory limit per deriver query")
+	queryDefault := int64(256 << 20)
+	if migrate || restore {
+		queryDefault = 128 << 20
+	}
+	queryMemory := flag.Int64("query-memory-bytes", queryDefault, "ClickHouse memory limit per deriver query")
 	flag.Parse()
 	if *batchRows < 1 || *batchBytes < 1 || *maxRows < 2 || *interval <= 0 || *queryMemory < 1 {
 		fmt.Fprintln(os.Stderr, "batch and query memory limits must be positive, max-rows-per-pass >= 2, interval > 0")
@@ -55,11 +66,27 @@ func main() {
 
 	d.batchSize, d.batchBytes, d.maxRows = *batchRows, *batchBytes, *maxRows
 
-	if err := waitSetup(ctx, d, *interval); err != nil {
-		log.Error("setup aborted", "err", err)
-		os.Exit(1)
+	if !((migrate || restore) && *dryRun) {
+		if err := waitSetup(ctx, d, *interval); err != nil {
+			log.Error("setup aborted", "err", err)
+			os.Exit(1)
+		}
 	}
-
+	if migrate || restore {
+		var report migrationReport
+		var err error
+		if restore {
+			report, err = d.restoreBodies(ctx, *dryRun)
+		} else {
+			report, err = d.migrate(ctx, *dryRun)
+		}
+		if err != nil {
+			log.Error("migration failed", "err", err)
+			os.Exit(1)
+		}
+		_ = json.NewEncoder(os.Stdout).Encode(report)
+		return
+	}
 	if *rebuild {
 		start := time.Now()
 		n, err := d.rebuild(ctx)

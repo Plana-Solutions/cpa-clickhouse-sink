@@ -1,0 +1,9 @@
+request status=200 stream=False
+request status=200 stream=True
+request status=200 stream=False
+Dedup production-image byte-exact SQL reconstruction verified. rows=3
+Production-image load verified. requests=3 usage=3 request_facts=3
+Released deriver verified in stock distroless image with mounted password file.
+[2026-11-19 02:35:07] [--------] [info ] [host.go:411] pluginhost: plugin loaded plugin_id=clickhouse-sink path=plugins/linux/arm64/clickhouse-sink.so
+[2026-11-19 02:35:07] [--------] [info ] [host.go:434] pluginhost: plugin registered plugin_id=clickhouse-sink plugin_name=clickhouse-sink version=0.1.0-plana.3 path=plugins/linux/arm64/clickhouse-sink.so
+[clickhouse-sink] body blobs written=1 skipped=2

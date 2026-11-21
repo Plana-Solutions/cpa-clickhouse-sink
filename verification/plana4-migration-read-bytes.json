@@ -1,0 +1,368 @@
+[
+  {
+    "rows": 32,
+    "side": "before",
+    "started": "2026-11-18 20:11:31.808045",
+    "report": {
+      "rows": 32,
+      "inline_bytes": 16778592,
+      "projected_uncompressed_bytes": 526628,
+      "dry_run": false
+    },
+    "steps": [
+      {
+        "step": "blob_read",
+        "count()": 33,
+        "sum(read_bytes)": 16812232,
+        "max(read_bytes)": 526296
+      },
+      {
+        "step": "candidates",
+        "count()": 33,
+        "sum(read_bytes)": 503942260,
+        "max(read_bytes)": 16780996
+      },
+      {
+        "step": "delete",
+        "count()": 1,
+        "sum(read_bytes)": 0,
+        "max(read_bytes)": 0
+      },
+      {
+        "step": "inline_read",
+        "count()": 32,
+        "sum(read_bytes)": 166251567,
+        "max(read_bytes)": 9963657
+      },
+      {
+        "step": "insert",
+        "count()": 33,
+        "sum(read_bytes)": 439508394,
+        "max(read_bytes)": 20976178
+      },
+      {
+        "step": "known_keys",
+        "count()": 32,
+        "sum(read_bytes)": 992,
+        "max(read_bytes)": 32
+      },
+      {
+        "step": "reader",
+        "count()": 32,
+        "sum(read_bytes)": 166243728,
+        "max(read_bytes)": 9963322
+      },
+      {
+        "step": "verify",
+        "count()": 39,
+        "sum(read_bytes)": 33910,
+        "max(read_bytes)": 1820
+      }
+    ]
+  },
+  {
+    "rows": 32,
+    "side": "after",
+    "started": "2026-11-18 20:12:03.491707",
+    "report": {
+      "rows": 32,
+      "inline_bytes": 16778592,
+      "projected_uncompressed_bytes": 526628,
+      "dry_run": false
+    },
+    "steps": [
+      {
+        "step": "blob_read",
+        "count()": 33,
+        "sum(read_bytes)": 16809147,
+        "max(read_bytes)": 526279
+      },
+      {
+        "step": "candidates",
+        "count()": 1,
+        "sum(read_bytes)": 16780064,
+        "max(read_bytes)": 16780064
+      },
+      {
+        "step": "delete",
+        "count()": 1,
+        "sum(read_bytes)": 0,
+        "max(read_bytes)": 0
+      },
+      {
+        "step": "inline_read",
+        "count()": 32,
+        "sum(read_bytes)": 166251567,
+        "max(read_bytes)": 9963657
+      },
+      {
+        "step": "insert",
+        "count()": 33,
+        "sum(read_bytes)": 166835661,
+        "max(read_bytes)": 9965984
+      },
+      {
+        "step": "known_keys",
+        "count()": 32,
+        "sum(read_bytes)": 1024,
+        "max(read_bytes)": 33
+      },
+      {
+        "step": "reader",
+        "count()": 32,
+        "sum(read_bytes)": 33701,
+        "max(read_bytes)": 2091
+      },
+      {
+        "step": "verify",
+        "count()": 39,
+        "sum(read_bytes)": 25296,
+        "max(read_bytes)": 1996
+      }
+    ]
+  },
+  {
+    "rows": 64,
+    "side": "before",
+    "started": "2026-11-18 20:13:00.918982",
+    "report": {
+      "rows": 64,
+      "inline_bytes": 33557184,
+      "projected_uncompressed_bytes": 528900,
+      "dry_run": false
+    },
+    "steps": [
+      {
+        "step": "blob_read",
+        "count()": 65,
+        "sum(read_bytes)": 33671599,
+        "max(read_bytes)": 528247
+      },
+      {
+        "step": "candidates",
+        "count()": 65,
+        "sum(read_bytes)": 1441012216,
+        "max(read_bytes)": 33560208
+      },
+      {
+        "step": "delete",
+        "count()": 1,
+        "sum(read_bytes)": 0,
+        "max(read_bytes)": 0
+      },
+      {
+        "step": "inline_read",
+        "count()": 64,
+        "sum(read_bytes)": 387540567,
+        "max(read_bytes)": 9963657
+      },
+      {
+        "step": "insert",
+        "count()": 65,
+        "sum(read_bytes)": 624163712,
+        "max(read_bytes)": 19927610
+      },
+      {
+        "step": "known_keys",
+        "count()": 64,
+        "sum(read_bytes)": 2016,
+        "max(read_bytes)": 32
+      },
+      {
+        "step": "reader",
+        "count()": 64,
+        "sum(read_bytes)": 387588544,
+        "max(read_bytes)": 9964857
+      },
+      {
+        "step": "verify",
+        "count()": 71,
+        "sum(read_bytes)": 108259,
+        "max(read_bytes)": 3138
+      }
+    ]
+  },
+  {
+    "rows": 64,
+    "side": "after",
+    "started": "2026-11-18 20:14:24.395549",
+    "report": {
+      "rows": 64,
+      "inline_bytes": 33557184,
+      "projected_uncompressed_bytes": 528900,
+      "dry_run": false
+    },
+    "steps": [
+      {
+        "step": "blob_read",
+        "count()": 65,
+        "sum(read_bytes)": 33614606,
+        "max(read_bytes)": 528057
+      },
+      {
+        "step": "candidates",
+        "count()": 1,
+        "sum(read_bytes)": 33560128,
+        "max(read_bytes)": 33560128
+      },
+      {
+        "step": "delete",
+        "count()": 1,
+        "sum(read_bytes)": 0,
+        "max(read_bytes)": 0
+      },
+      {
+        "step": "inline_read",
+        "count()": 64,
+        "sum(read_bytes)": 387540567,
+        "max(read_bytes)": 9963657
+      },
+      {
+        "step": "insert",
+        "count()": 65,
+        "sum(read_bytes)": 388114442,
+        "max(read_bytes)": 9964766
+      },
+      {
+        "step": "known_keys",
+        "count()": 64,
+        "sum(read_bytes)": 2080,
+        "max(read_bytes)": 33
+      },
+      {
+        "step": "reader",
+        "count()": 64,
+        "sum(read_bytes)": 86071,
+        "max(read_bytes)": 7927
+      },
+      {
+        "step": "verify",
+        "count()": 71,
+        "sum(read_bytes)": 51446,
+        "max(read_bytes)": 3573
+      }
+    ]
+  },
+  {
+    "rows": 128,
+    "side": "before",
+    "started": "2026-11-18 20:15:56.150153",
+    "report": {
+      "rows": 128,
+      "inline_bytes": 67114368,
+      "projected_uncompressed_bytes": 533444,
+      "dry_run": false
+    },
+    "steps": [
+      {
+        "step": "blob_read",
+        "count()": 129,
+        "sum(read_bytes)": 67524831,
+        "max(read_bytes)": 531346
+      },
+      {
+        "step": "candidates",
+        "count()": 129,
+        "sum(read_bytes)": 4368192759,
+        "max(read_bytes)": 55584372
+      },
+      {
+        "step": "delete",
+        "count()": 2,
+        "sum(read_bytes)": 0,
+        "max(read_bytes)": 0
+      },
+      {
+        "step": "inline_read",
+        "count()": 128,
+        "sum(read_bytes)": 785569896,
+        "max(read_bytes)": 9963676
+      },
+      {
+        "step": "insert",
+        "count()": 129,
+        "sum(read_bytes)": 1264777286,
+        "max(read_bytes)": 19930796
+      },
+      {
+        "step": "known_keys",
+        "count()": 128,
+        "sum(read_bytes)": 4064,
+        "max(read_bytes)": 32
+      },
+      {
+        "step": "reader",
+        "count()": 128,
+        "sum(read_bytes)": 785822197,
+        "max(read_bytes)": 9966507
+      },
+      {
+        "step": "verify",
+        "count()": 135,
+        "sum(read_bytes)": 430907,
+        "max(read_bytes)": 6273
+      }
+    ]
+  },
+  {
+    "rows": 128,
+    "side": "after",
+    "started": "2026-11-18 20:17:49.833904",
+    "report": {
+      "rows": 128,
+      "inline_bytes": 67114368,
+      "projected_uncompressed_bytes": 533444,
+      "dry_run": false
+    },
+    "steps": [
+      {
+        "step": "blob_read",
+        "count()": 129,
+        "sum(read_bytes)": 67276971,
+        "max(read_bytes)": 531651
+      },
+      {
+        "step": "candidates",
+        "count()": 1,
+        "sum(read_bytes)": 67120256,
+        "max(read_bytes)": 67120256
+      },
+      {
+        "step": "delete",
+        "count()": 2,
+        "sum(read_bytes)": 0,
+        "max(read_bytes)": 0
+      },
+      {
+        "step": "inline_read",
+        "count()": 128,
+        "sum(read_bytes)": 785569896,
+        "max(read_bytes)": 9963676
+      },
+      {
+        "step": "insert",
+        "count()": 129,
+        "sum(read_bytes)": 786194704,
+        "max(read_bytes)": 9964804
+      },
+      {
+        "step": "known_keys",
+        "count()": 128,
+        "sum(read_bytes)": 4192,
+        "max(read_bytes)": 33
+      },
+      {
+        "step": "reader",
+        "count()": 128,
+        "sum(read_bytes)": 279774,
+        "max(read_bytes)": 16316
+      },
+      {
+        "step": "verify",
+        "count()": 135,
+        "sum(read_bytes)": 149941,
+        "max(read_bytes)": 7167
+      }
+    ]
+  }
+]

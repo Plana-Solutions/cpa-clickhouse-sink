@@ -1,0 +1,58 @@
+name: Tests
+on:
+  pull_request:
+  push:
+    branches: [main, feat/lossless-body-dedup]
+permissions:
+  contents: read
+jobs:
+  clickhouse-25-8:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:25.8@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77
+        env:
+          CLICKHOUSE_SKIP_USER_SETUP: '1'
+        ports: ['8123:8123']
+        options: >-
+          --memory 1503238553
+          --health-cmd "clickhouse-client --query 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Unit and body integration tests
+        env:
+          BODY_INTEGRATION_URL: http://127.0.0.1:8123
+          DERIVER_BINARY: /tmp/clickhouse-deriver
+        run: |
+          (cd deriver && go build -o /tmp/clickhouse-deriver .)
+          go vet ./...
+          go test -race -count=1 -timeout 15m -v ./...
+      - name: Start a fresh capped server for the memory-sensitive tests
+        run: |
+          docker stop "${{ job.services.clickhouse.id }}"
+          docker run -d --name deriver-${{ github.run_id }} --memory 1503238553 -e CLICKHOUSE_SKIP_USER_SETUP=1 -p 127.0.0.1:18123:8123 clickhouse/clickhouse-server:25.8@sha256:0152dd511befe6a2c2ef53e930726179669b08116da78500b37c51c96ff5ee77
+          for attempt in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:18123/ --data-binary 'SELECT 1' > /dev/null; then break; fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:18123/ --data-binary 'SELECT 1'
+      - name: Deriver integration tests
+        env:
+          DERIVER_INTEGRATION: '1'
+          CLICKHOUSE_URL: http://127.0.0.1:18123
+        run: |
+          cd deriver
+          go vet ./...
+          go test -race -count=1 -timeout 10m -v -run 'TestMigrateNewSkeleton|TestRestoreKeepsSkeletonOnIncompleteBody|TestMigrationSkipsOversized' .
+          go test -race -count=1 -timeout 10m -v -skip 'TestMigrateNewSkeleton|TestRestoreKeepsSkeletonOnIncompleteBody|TestMigrationSkipsOversized' ./...
+      - name: Remove the additional server and its volumes
+        if: always()
+        run: docker rm -fv deriver-${{ github.run_id }}

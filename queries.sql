@@ -39,12 +39,12 @@ LIMIT 50
 --    This returns that request's raw body and its reply.
 WITH 'EDIT conversation_id' AS conv,
      (SELECT topK(1)(system_prompt_hash)[1] FROM cliproxy.request_facts WHERE conversation_id = conv) AS main_prompt
-SELECT f.started_at, f.request_id, f.reply_text, r.request_body
-FROM cliproxy.request_facts AS f
-INNER JOIN cliproxy.requests AS r ON r.request_id = f.request_id
-WHERE f.conversation_id = conv AND f.system_prompt_hash = main_prompt
-ORDER BY f.started_at DESC
-LIMIT 1
+SELECT request_id, request_body, body_status
+FROM cliproxy.raw_request(id = (
+ SELECT request_id FROM cliproxy.request_facts
+ WHERE conversation_id = conv AND system_prompt_hash = main_prompt
+ ORDER BY started_at DESC LIMIT 1
+))
 ;
 -- 4. Most-used tools per client in the last 30 days.
 SELECT client, tool_name, count() AS calls
@@ -150,3 +150,18 @@ WHERE started_at > now() - INTERVAL 30 DAY
 GROUP BY parse_status, source_format
 ORDER BY requests DESC
 LIMIT 50
+
+;
+-- Missing items. Bound the request time range before an audit on a large corpus.
+SELECT r.request_id, r.lineage, hex(h) AS missing_hash
+FROM cliproxy.requests AS r ARRAY JOIN body_refs AS h
+LEFT ANTI JOIN cliproxy.body_blobs AS b ON r.lineage=b.lineage AND h=b.hash
+WHERE r.started_at > now()-INTERVAL 1 DAY
+;
+-- Item hash audit. Re-redaction must update both keys and request digests.
+SELECT lineage, hex(hash) AS corrupt_hash
+FROM cliproxy.body_blobs WHERE hash != substring(SHA256(data),1,16)
+;
+-- One request's end-to-end hash audit and replay boundary.
+SELECT body_status, hex(SHA256(request_body)) AS reconstructed_sha256
+FROM cliproxy.raw_request(id='EDIT request_id')

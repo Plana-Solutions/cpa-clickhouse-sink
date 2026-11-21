@@ -31,6 +31,7 @@ const (
 // Row is a raw `requests` row as read by the deriver (column names as JSON tags).
 // Timestamps are kept as ClickHouse text so they are copied without loss.
 type Row struct {
+	BodyIncomplete bool              `json:"-"`
 	RequestID      string            `json:"request_id"`
 	TraceID        string            `json:"trace_id"`
 	StartedAt      string            `json:"started_at"`

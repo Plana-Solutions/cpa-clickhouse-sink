@@ -40,6 +40,7 @@ type sinkConfig struct {
 	Username    string
 	Password    string
 	StoreBodies bool
+	BodyDedup   bool
 	// SecretFiles and DisabledRules configure redaction (see redact.go).
 	SecretFiles   []string
 	DisabledRules []string
@@ -47,19 +48,20 @@ type sinkConfig struct {
 
 func (c sinkConfig) equal(o sinkConfig) bool {
 	return c.URL == o.URL && c.Database == o.Database && c.Username == o.Username &&
-		c.Password == o.Password && c.StoreBodies == o.StoreBodies &&
+		c.Password == o.Password && c.StoreBodies == o.StoreBodies && c.BodyDedup == o.BodyDedup &&
 		strings.Join(c.SecretFiles, "\x00") == strings.Join(o.SecretFiles, "\x00") &&
 		strings.Join(c.DisabledRules, "\x00") == strings.Join(o.DisabledRules, "\x00")
 }
 
-// batch is an insert unit. Once cut, its rows and token never change, so a
-// retry after an ambiguous failure is deduplicated by ClickHouse
-// (insert_deduplication_token + non_replicated_deduplication_window).
+// Legacy and usage batches keep stable tokens across retries. Body batches allow re-inserts after repair.
 type batch struct {
-	table string
-	rows  [][]byte
-	token string
-	size  int
+	first, last string
+	format      string
+	columns     string
+	table       string
+	rows        [][]byte
+	token       string
+	size        int
 }
 
 func newBatch(table string, rows [][]byte) batch {
@@ -75,14 +77,20 @@ func newBatch(table string, rows [][]byte) batch {
 
 // sink batches JSONEachRow rows per table and inserts them over HTTP.
 type sink struct {
-	mu        sync.Mutex
-	cfg       sinkConfig
-	pending   map[string][][]byte
-	retry     []batch
-	buffered  int
-	dropped   int
-	schemaOK  bool
-	lastError string
+	cacheCfg                   sinkConfig
+	bodyPending                []bodyRequest
+	bodyPendingSize            int
+	bodyRetry                  *bodyUnit
+	known                      map[uint64]*knownLineage
+	blobsWritten, blobsSkipped int
+	mu                         sync.Mutex
+	cfg                        sinkConfig
+	pending                    map[string][][]byte
+	retry                      []batch
+	buffered                   int
+	dropped                    int
+	schemaOK                   bool
+	lastError                  string
 
 	client *http.Client
 	kick   chan struct{}
@@ -178,7 +186,15 @@ func (s *sink) flushNow() {
 	batches := s.retry
 	s.retry = nil
 	for table, rows := range s.pending {
-		batches = append(batches, newBatch(table, rows))
+		for len(rows) > 0 {
+			n, size := 1, len(rows[0])
+			for n < len(rows) && size+len(rows[n]) <= flushBytes {
+				size += len(rows[n])
+				n++
+			}
+			batches = append(batches, newBatch(table, rows[:n]))
+			rows = rows[n:]
+		}
 	}
 	s.pending = make(map[string][][]byte)
 	dropped := s.dropped
@@ -189,7 +205,10 @@ func (s *sink) flushNow() {
 	if dropped > 0 {
 		logf("buffer full, dropped %d rows", dropped)
 	}
-	if len(batches) == 0 {
+	s.mu.Lock()
+	hasBodies := s.bodyRetry != nil || len(s.bodyPending) > 0
+	s.mu.Unlock()
+	if len(batches) == 0 && !hasBodies {
 		return
 	}
 	if !schemaOK {
@@ -216,7 +235,13 @@ func (s *sink) flushNow() {
 		}
 		s.release(b.size)
 	}
-	s.report(nil)
+	bodyErr := s.flushBodies(cfg)
+	if bodyErr != nil {
+		s.mu.Lock()
+		s.schemaOK = false
+		s.mu.Unlock()
+	}
+	s.report(bodyErr)
 }
 
 // insertBatch inserts b. When ClickHouse rejects the data itself (HTTP 400)
@@ -234,6 +259,9 @@ func (s *sink) insertBatch(cfg sinkConfig, b batch) error {
 	mid := len(b.rows) / 2
 	for _, half := range [][][]byte{b.rows[:mid], b.rows[mid:]} {
 		part := newBatch(b.table, half)
+		part.format = b.format
+		part.columns = b.columns
+		part.first, part.last = b.first, b.last
 		if errPart := s.insertBatch(cfg, part); errPart != nil {
 			return errPart
 		}
@@ -288,11 +316,32 @@ func (s *sink) ensureSchema(cfg sinkConfig) error {
 }
 
 func (s *sink) insert(cfg sinkConfig, b batch) error {
+	format := b.format
+	if format == "" {
+		format = "JSONEachRow"
+	}
+	table := cfg.Database + "." + b.table
+	if b.columns != "" {
+		table += " (" + b.columns + ")"
+	}
 	params := url.Values{
-		"query":                      {fmt.Sprintf("INSERT INTO %s.%s FORMAT JSONEachRow", cfg.Database, b.table)},
+		"query":                      {fmt.Sprintf("INSERT INTO %s FORMAT %s", table, format)},
 		"insert_deduplication_token": {b.token},
 	}
-	body := bytes.Join(b.rows, []byte{'\n'})
+	if b.format == "RowBinary" {
+		params.Set("insert_deduplicate", "0")
+		if b.table == tableRequests {
+			params.Set("query", fmt.Sprintf("INSERT INTO %s SELECT * FROM input({row_schema:String}) WHERE (started_at,request_id) NOT IN (SELECT started_at,request_id FROM %s.requests PREWHERE started_at>={first:DateTime64(9,'UTC')} AND started_at<={last:DateTime64(9,'UTC')}) LIMIT 1 BY started_at,request_id FORMAT RowBinary", table, cfg.Database))
+			params.Set("param_row_schema", bodyRequestStructure)
+			params.Set("param_first", b.first)
+			params.Set("param_last", b.last)
+		}
+	}
+	sep := []byte{'\n'}
+	if b.format == "RowBinary" {
+		sep = nil
+	}
+	body := bytes.Join(b.rows, sep)
 	if errExec := s.exec(cfg, params, string(body)); errExec != nil {
 		return fmt.Errorf("insert %d rows into %s: %w", len(b.rows), b.table, errExec)
 	}

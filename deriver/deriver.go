@@ -2,10 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"strings"
 	"time"
 
+	"github.com/Plana-Solutions/cpa-clickhouse-sink/bodystore"
 	"github.com/Plana-Solutions/cpa-clickhouse-sink/deriver/extract"
 	"github.com/Plana-Solutions/cpa-clickhouse-sink/redact"
 )
@@ -31,7 +35,10 @@ func newDeriver(ch *clickhouse, db string, log *slog.Logger, r *redact.Redactor)
 
 // setup creates the derived table and views.
 func (d *deriver) setup(ctx context.Context) error {
-	for _, stmt := range schemaFor(derivedSchema, d.db) {
+	for _, stmt := range schemaFor(append(strings.Split(bodystore.Schema, "\n;\n"), derivedSchema...), d.db) {
+		if strings.TrimSpace(stmt) == "" {
+			continue
+		}
 		if err := d.ch.exec(ctx, stmt, nil); err != nil {
 			return err
 		}
@@ -41,6 +48,27 @@ func (d *deriver) setup(ctx context.Context) error {
 
 // rebuild truncates request_facts and derives everything again.
 func (d *deriver) rebuild(ctx context.Context) (int, error) {
+	// Validate before destructive writes. Writers and blob GC must be stopped for rebuild.
+
+	rows, err := migrationRows[candidate](ctx, d.ch, "SELECT request_id,body_len AS bytes FROM "+d.db+".requests WHERE body_sha256!=repeat(char(0),32) ORDER BY started_at,request_id LIMIT 1 BY request_id", nil)
+	if err != nil {
+		return 0, err
+	}
+	for len(rows) > 0 {
+		batch := bodyBatch(rows[:min(d.batchSize, len(rows))], d.batchBytes)
+		ids := make([]string, len(batch))
+		for i, r := range batch {
+			ids[i] = r.RequestID
+		}
+		err := migrationRetry(ctx, func() error {
+			return d.bodyReader().ReadBatch(ctx, ids, func(id, ts string, body []byte) error { return nil })
+		})
+		if err != nil {
+			return 0, fmt.Errorf("rebuild refused before truncate for batch %v: %w", ids, err)
+		}
+		rows = rows[len(batch):]
+	}
+
 	if err := d.ch.exec(ctx, "TRUNCATE TABLE "+d.db+".request_facts", nil); err != nil {
 		return 0, fmt.Errorf("truncate: %w", err)
 	}
@@ -101,6 +129,13 @@ func (d *deriver) runWindow(ctx context.Context, lower, upper string, limit int,
 			var facts []any
 			seen := map[string]bool{}
 			err := d.fetch(ctx, ids, func(r extract.Row) error {
+				if r.BodyIncomplete {
+					f := extract.Unparseable(r, "body incomplete")
+					f.ParseStatus = "body_incomplete"
+					redactFacts(d.redactor, &f)
+					facts = append(facts, toFactsRow(f))
+					return nil
+				}
 				conv := extract.Conversation(r)
 				prior := seen[conv]
 				if !prior && conv != "" {
@@ -198,7 +233,7 @@ func (d *deriver) candidates(ctx context.Context, lower, upper, cursorTS, cursor
 	q := `WITH (SELECT min(ingested_at) + INTERVAL 1 HOUR FROM ` + d.db + `.requests
  WHERE ingested_at >= {lower:DateTime64(9, 'UTC')} AND ingested_at < {upper:DateTime64(9, 'UTC')}
  AND (ingested_at, request_id) > ({cts:DateTime64(9, 'UTC')}, {cid:String})) AS window_upper
-SELECT request_id, ingested_at
+SELECT DISTINCT request_id, ingested_at
 FROM ` + d.db + `.requests
 WHERE ingested_at >= {lower:DateTime64(9, 'UTC')} AND ingested_at < {upper:DateTime64(9, 'UTC')}
  AND ingested_at < window_upper
@@ -221,9 +256,11 @@ ORDER BY ingested_at, request_id LIMIT {limit:UInt32} SETTINGS max_threads=1`
 		return nil, nil, err
 	}
 	pending := rows[:0]
+	selected := map[string]bool{}
 	ids = nil
 	for _, r := range rows {
-		if !known[r.RequestID] {
+		if !known[r.RequestID] && !selected[r.RequestID] {
+			selected[r.RequestID] = true
 			pending = append(pending, r)
 			ids = append(ids, r.RequestID)
 		}
@@ -233,21 +270,66 @@ ORDER BY ingested_at, request_id LIMIT {limit:UInt32} SETTINGS max_threads=1`
 		return rows, &last, nil
 	}
 	sizes := map[string]uint64{}
-	err = selectRows(ctx, d.ch, `SELECT request_id, length(request_body)+length(response_body)+arraySum(arrayMap(x -> length(x),response_chunks))+length(toJSONString(request_headers))+length(error) AS bytes FROM `+d.db+`.requests PREWHERE request_id IN {ids:Array(String)} SETTINGS max_threads=1, max_block_size=1, preferred_block_size_bytes=1048576`, map[string]string{"ids": chArray(ids)}, func(r candidate) { sizes[r.RequestID] = r.Bytes })
+	err = selectRows(ctx, d.ch, `SELECT request_id, body_len+length(request_body)+length(response_body)+arraySum(arrayMap(x -> length(x),response_chunks))+length(toJSONString(request_headers))+length(error) AS bytes FROM `+d.db+`.requests PREWHERE request_id IN {ids:Array(String)} SETTINGS max_threads=1, max_block_size=1, preferred_block_size_bytes=1048576`, map[string]string{"ids": chArray(ids)}, func(r candidate) { sizes[r.RequestID] = r.Bytes })
 	for i := range rows {
 		rows[i].Bytes = sizes[rows[i].RequestID]
 	}
 	return rows, &last, err
 }
 
+func (d *deriver) bodyReader() bodystore.Reader {
+	return bodystore.Reader{Database: d.db, Query: func(ctx context.Context, q string, p map[string]string) (io.ReadCloser, error) {
+		return d.ch.do(ctx, q, p, nil)
+	}}
+}
+
 func (d *deriver) fetch(ctx context.Context, ids []string, fn func(extract.Row) error) error {
-	q := `SELECT request_id, trace_id, started_at, ingested_at,
+	blobs, err := d.bodyReader().Load(ctx, ids)
+	if err != nil {
+		return err
+	}
+	q := `SELECT * FROM (SELECT request_id, trace_id, started_at, ingested_at,
  duration_ms, path, source_format, model, stream, outcome, status_code, error,
- request_headers, request_body, response_body, response_chunks, redaction_count
+ request_headers, response_body, response_chunks, redaction_count, ` + bodystore.Projection + `
 FROM ` + d.db + `.requests PREWHERE request_id IN {ids:Array(String)}
-ORDER BY ingested_at, request_id
+ORDER BY body_sha256=repeat(char(0),32) LIMIT 1 BY request_id)
+ORDER BY ingested_at,request_id
 SETTINGS max_threads=1, max_block_size=1, preferred_block_size_bytes=1048576`
-	return streamRows(ctx, d.ch, q, map[string]string{"ids": chArray(ids)}, fn)
+	type stored struct {
+		extract.Row
+		bodystore.Body
+	}
+	pending := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		pending[id] = true
+	}
+	err = streamRows(ctx, d.ch, q, map[string]string{"ids": chArray(ids)}, func(r stored) error {
+		if !pending[r.RequestID] {
+			return fmt.Errorf("unexpected or duplicate request id in body batch")
+		}
+		delete(pending, r.RequestID)
+		body, err := r.Body.Restore(blobs)
+		if errors.Is(err, bodystore.ErrIncomplete) {
+			body, err = d.bodyReader().Read(ctx, r.RequestID, r.StartedAt)
+			if err != nil && !errors.Is(err, bodystore.ErrIncomplete) {
+				return err
+			}
+		}
+		if err != nil {
+			d.log.Warn("body incomplete", "request_id", r.RequestID)
+			r.Row.BodyIncomplete = true
+			return fn(r.Row)
+		}
+		r.Row.RequestBody = string(body)
+		return fn(r.Row)
+	})
+	if err != nil {
+		return err
+	}
+	if len(pending) != 0 {
+		return fmt.Errorf("body batch missing %d requested ids", len(pending))
+	}
+	return nil
 }
 
 func (d *deriver) knownConversations(ctx context.Context, ids []string) (map[string]bool, error) {
