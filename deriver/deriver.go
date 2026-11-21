@@ -109,6 +109,7 @@ func (d *deriver) pass(ctx context.Context) (int, error) {
 func (d *deriver) runWindow(ctx context.Context, lower, upper string, limit int, checkpoint bool) (int, error) {
 	start := time.Now()
 	cursorTS, cursorID := lower, ""
+	committed := ""
 	total := 0
 	for total < limit {
 		count := limit - total
@@ -167,8 +168,17 @@ func (d *deriver) runWindow(ctx context.Context, lower, upper string, limit int,
 				if err := d.ch.insertJSON(ctx, d.db+".deriver_progress", []any{map[string]string{"ingested_at": last.IngestedAt}}); err != nil {
 					return total, fmt.Errorf("checkpoint: %w", err)
 				}
+				committed = last.IngestedAt
 			}
 			candidates = candidates[len(batch):]
+		}
+	}
+	// Every row up to the cursor now has facts, including pages that were all
+	// derived already (for example by the fresh window). Commit the cursor so
+	// the next pass does not rescan an ever-growing derived range.
+	if checkpoint && cursorID != "" && cursorTS != committed {
+		if err := d.ch.insertJSON(ctx, d.db+".deriver_progress", []any{map[string]string{"ingested_at": cursorTS}}); err != nil {
+			return total, fmt.Errorf("checkpoint: %w", err)
 		}
 	}
 	if total > 0 {

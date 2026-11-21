@@ -533,3 +533,28 @@ func TestMigrationVerificationRejectsInlineFallback(t *testing.T) {
 		t.Fatal("inline recovery source changed", got)
 	}
 }
+
+func TestBacklogCheckpointAdvancesOverDerivedRows(t *testing.T) {
+	d := testDeriver(t)
+	at := time.Now().Add(-time.Minute)
+	insertRaw(t, d, fixtureRow(t, "chat_stream", "fresh-a", at), fixtureRow(t, "chat_stream", "fresh-b", at.Add(time.Second)))
+	// The fresh window derives both rows and must not touch the checkpoint.
+	if n, err := d.pass(context.Background()); err != nil || n != 2 {
+		t.Fatalf("pass %d %v", n, err)
+	}
+	if got := scalar(t, d, "SELECT count() FROM "+testDB+".deriver_progress"); got != "0" {
+		t.Fatal("fresh work advanced checkpoint", got)
+	}
+	// A backlog scan that finds only derived rows still commits its cursor,
+	// so later passes do not rescan the same range forever.
+	if n, err := d.runWindow(context.Background(), epoch, "2100-01-01 00:00:00.000000000", d.maxRows, true); err != nil || n != 0 {
+		t.Fatalf("backlog %d %v", n, err)
+	}
+	want := scalar(t, d, "SELECT max(ingested_at) FROM "+testDB+".requests")
+	if got := scalar(t, d, "SELECT max(ingested_at) FROM "+testDB+".deriver_progress"); got != want {
+		t.Fatalf("checkpoint %q, want %q", got, want)
+	}
+	if got := scalar(t, d, "SELECT count() FROM "+testDB+".request_facts"); got != "2" {
+		t.Fatal("rederived", got)
+	}
+}
