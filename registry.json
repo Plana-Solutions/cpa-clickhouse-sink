@@ -5,7 +5,7 @@
     "name": "ClickHouse Sink (Plana ARM64)",
     "description": "Plana linux/arm64 build. Captures redacted requests and usage in ClickHouse. Requires a separate ClickHouse server and deriver service.",
     "author": "api-token / Plana-Solutions",
-    "version": "0.1.0-plana.10",
+    "version": "0.1.0-plana.11",
     "repository": "https://github.com/Plana-Solutions/cpa-clickhouse-sink",
     "homepage": "https://github.com/Plana-Solutions/cpa-clickhouse-sink",
     "license": "MIT",
