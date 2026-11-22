@@ -414,7 +414,7 @@ func TestDeriverQueriesCarryResourceLimits(t *testing.T) {
 	ch.memoryBytes = 123456
 	ch.http.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		q := r.URL.Query()
-		if q.Get("max_threads") != "1" || q.Get("max_memory_usage") != "123456" || q.Get("max_execution_time") != "30" {
+		if q.Get("max_threads") != "1" || q.Get("max_memory_usage") != "123456" || q.Get("max_execution_time") != "30" || q.Get("use_query_condition_cache") != "0" {
 			t.Fatalf("resource settings %v", q)
 		}
 		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(""))}, nil
@@ -556,5 +556,13 @@ func TestBacklogCheckpointAdvancesOverDerivedRows(t *testing.T) {
 	}
 	if got := scalar(t, d, "SELECT count() FROM "+testDB+".request_facts"); got != "2" {
 		t.Fatal("rederived", got)
+	}
+	// An idle rescan of the same range must not append another checkpoint row.
+	rows := scalar(t, d, "SELECT count() FROM "+testDB+".deriver_progress")
+	if _, err := d.runWindow(context.Background(), epoch, "2100-01-01 00:00:00.000000000", d.maxRows, true); err != nil {
+		t.Fatal(err)
+	}
+	if got := scalar(t, d, "SELECT count() FROM "+testDB+".deriver_progress"); got != rows {
+		t.Fatalf("idle pass wrote a checkpoint: %s rows, want %s", got, rows)
 	}
 }

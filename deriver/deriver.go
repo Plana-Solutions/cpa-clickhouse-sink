@@ -27,6 +27,9 @@ type deriver struct {
 	log        *slog.Logger
 	// extract is extract.Extract; tests replace it to inject a poison row.
 	extract func(extract.Row, bool) extract.Facts
+	// checkpointed is the last watermark this process wrote, so an idle pass
+	// does not append the same row again.
+	checkpointed string
 }
 
 func newDeriver(ch *clickhouse, db string, log *slog.Logger, r *redact.Redactor) *deriver {
@@ -109,7 +112,6 @@ func (d *deriver) pass(ctx context.Context) (int, error) {
 func (d *deriver) runWindow(ctx context.Context, lower, upper string, limit int, checkpoint bool) (int, error) {
 	start := time.Now()
 	cursorTS, cursorID := lower, ""
-	committed := ""
 	total := 0
 	for total < limit {
 		count := limit - total
@@ -168,7 +170,7 @@ func (d *deriver) runWindow(ctx context.Context, lower, upper string, limit int,
 				if err := d.ch.insertJSON(ctx, d.db+".deriver_progress", []any{map[string]string{"ingested_at": last.IngestedAt}}); err != nil {
 					return total, fmt.Errorf("checkpoint: %w", err)
 				}
-				committed = last.IngestedAt
+				d.checkpointed = last.IngestedAt
 			}
 			candidates = candidates[len(batch):]
 		}
@@ -176,10 +178,11 @@ func (d *deriver) runWindow(ctx context.Context, lower, upper string, limit int,
 	// Every row up to the cursor now has facts, including pages that were all
 	// derived already (for example by the fresh window). Commit the cursor so
 	// the next pass does not rescan an ever-growing derived range.
-	if checkpoint && cursorID != "" && cursorTS != committed {
+	if checkpoint && cursorID != "" && cursorTS != d.checkpointed {
 		if err := d.ch.insertJSON(ctx, d.db+".deriver_progress", []any{map[string]string{"ingested_at": cursorTS}}); err != nil {
 			return total, fmt.Errorf("checkpoint: %w", err)
 		}
+		d.checkpointed = cursorTS
 	}
 	if total > 0 {
 		d.log.Info("window done", "rows", total, "since", lower, "took", time.Since(start))

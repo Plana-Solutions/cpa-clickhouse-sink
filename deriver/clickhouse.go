@@ -38,6 +38,9 @@ func (c *clickhouse) do(ctx context.Context, query string, params map[string]str
 	q.Set("http_write_exception_in_output_format", "0")
 	q.Set("max_execution_time", "30")
 	q.Set("max_memory_usage", fmt.Sprint(c.memoryBytes))
+	// The deriver re-reads a sliding window every pass; each distinct filter
+	// would add a query condition cache entry that is never reused.
+	q.Set("use_query_condition_cache", "0")
 	for k, v := range params {
 		q.Set("param_"+k, v)
 	}
@@ -195,7 +198,7 @@ func (c *clickhouse) external(ctx context.Context, query string, params map[stri
 	if err = w.Close(); err != nil {
 		return err
 	}
-	q := url.Values{"query": {query}, "insert_deduplicate": {"0"}, "http_write_exception_in_output_format": {"0"}, "skeleton_format": {"RowBinary"}, "skeleton_structure": {structure}, "max_threads": {"1"}, "max_memory_usage": {fmt.Sprint(c.memoryBytes)}, "max_execution_time": {"30"}}
+	q := url.Values{"query": {query}, "insert_deduplicate": {"0"}, "http_write_exception_in_output_format": {"0"}, "skeleton_format": {"RowBinary"}, "skeleton_structure": {structure}, "max_threads": {"1"}, "max_memory_usage": {fmt.Sprint(c.memoryBytes)}, "max_execution_time": {"30"}, "use_query_condition_cache": {"0"}}
 	for k, v := range params {
 		q.Set("param_"+k, v)
 	}
